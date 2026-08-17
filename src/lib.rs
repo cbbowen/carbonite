@@ -148,6 +148,11 @@
 //! be complete. Adding a field requires `#[serde(default)]` to read old data,
 //! exactly as with JSON.
 
+// Compile the README's examples as doctests so they can never rot.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 pub mod columnar;
 mod de;
 mod error;
