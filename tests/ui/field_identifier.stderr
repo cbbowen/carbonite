@@ -1,0 +1,5 @@
+error: carbonite cannot derive Schema for a serde identifier type: it deserializes from the names of another type's fields or variants rather than from data of its own, so a schema would misdescribe it
+ --> tests/ui/field_identifier.rs:5:9
+  |
+5 | #[serde(field_identifier, rename_all = "snake_case")]
+  |         ^^^^^^^^^^^^^^^^

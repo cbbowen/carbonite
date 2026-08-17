@@ -1,0 +1,5 @@
+error: carbonite cannot statically determine the schema of a field using serde(with); use runtime tracing (Schema::new) instead
+ --> tests/ui/with.rs:5:13
+  |
+5 |     #[serde(with = "some_module")]
+  |             ^^^^

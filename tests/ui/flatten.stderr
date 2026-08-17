@@ -1,0 +1,5 @@
+error: carbonite cannot represent serde(flatten); it requires a self-describing format
+ --> tests/ui/flatten.rs:6:13
+  |
+6 |     #[serde(flatten)]
+  |             ^^^^^^^

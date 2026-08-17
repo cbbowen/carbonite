@@ -1,0 +1,5 @@
+error: carbonite rejects skip_serializing_if: columnar rows must be complete
+ --> tests/ui/skip_serializing_if.rs:5:13
+  |
+5 |     #[serde(skip_serializing_if = "Option::is_none")]
+  |             ^^^^^^^^^^^^^^^^^^^

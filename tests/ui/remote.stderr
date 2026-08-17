@@ -1,0 +1,17 @@
+error: carbonite cannot derive Schema for serde(remote): the generated code is a module of conversion functions rather than impls on this type, so there is nothing to hang a schema on
+ --> tests/ui/remote.rs:4:9
+  |
+4 | #[serde(remote = "std::time::Duration")]
+  |         ^^^^^^
+
+error[E0616]: field `secs` of struct `Duration` is private
+ --> tests/ui/remote.rs:6:5
+  |
+6 |     secs: u64,
+  |     ^^^^ private field
+
+error[E0616]: field `nanos` of struct `Duration` is private
+ --> tests/ui/remote.rs:7:5
+  |
+7 |     nanos: u32,
+  |     ^^^^^ private field

@@ -1,0 +1,5 @@
+error: carbonite cannot infer a schema from serde(from) alone, because serde(from) and serde(into) may name different shapes while carbonite has one schema for both directions; declare the wire type with `#[carbonite(as = "u32")]`
+ --> tests/ui/from_without_as.rs:5:16
+  |
+5 | #[serde(from = "u32", into = "u32")]
+  |                ^^^^^

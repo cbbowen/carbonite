@@ -1,0 +1,5 @@
+error: serde(transparent) and carbonite(as) describe different wire types for the same container; keep only one
+ --> tests/ui/as_with_transparent.rs:6:8
+  |
+6 | struct Wrapper(u32);
+  |        ^^^^^^^

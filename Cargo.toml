@@ -64,6 +64,7 @@ flate2 = "1"
 postcard = { version = "1", features = ["alloc"] }
 proptest = "1"
 serde_json = "1"
+trybuild = "1.0.119"
 
 [[bench]]
 name = "compare"

@@ -1,0 +1,5 @@
+error: carbonite cannot derive Schema for untagged or internally/adjacently tagged enums; only externally tagged (default) enums have a columnar layout
+ --> tests/ui/untagged.rs:4:9
+  |
+4 | #[serde(untagged)]
+  |         ^^^^^^^^

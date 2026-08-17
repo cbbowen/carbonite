@@ -141,9 +141,10 @@ scope would close the hazard outright, but the `Serialize` impl lacks a
   `ser.rs`, `compat.rs` rely on two trees staying structurally parallel. A
   fused annotated tree (layout ids attached to schema nodes, built once per
   `Serializer`/`Deserializer`) would delete the invariant class.
-- [ ] **Split the derive** (1383 lines, one file) into attribute-parsing /
-  schema-codegen / columnar-codegen modules; add trybuild UI tests locking in
-  its error messages.
+- [x] **Split the derive** into `attrs` (parsing and rejection), `model`
+  (field/generics analysis), `schema` (schema-tree codegen), `columnar`
+  (fast-path codegen), `as_repr`, and `rename`. Ten trybuild cases in
+  `tests/ui/` lock in the rejection messages.
 - [x] **Add a fuzz target**: `fuzz/` (excluded from the workspace) carries
   three libFuzzer targets — the serde-driven reader, the columnar reader, and
   the schema decoder (which also asserts the decode/re-encode identity) —

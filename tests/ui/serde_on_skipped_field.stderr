@@ -1,0 +1,5 @@
+error: this field is `serde(skip)`, so it has no columns and nothing for carbonite(serde) to route
+ --> tests/ui/serde_on_skipped_field.rs:7:5
+  |
+7 |     #[carbonite(serde)]
+  |     ^^^^^^^^^^^^^^^^^^^
