@@ -604,13 +604,20 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                 visitor.visit_borrowed_bytes(self.cursors[*data].take(n)?)
             }
             (SchemaNode::Unit | SchemaNode::UnitStruct { .. }, LNode::Unit) => visitor.visit_unit(),
-            (SchemaNode::NewtypeStruct { inner, .. }, LNode::Newtype(linner)) => visitor
-                .visit_newtype_struct(ValueDeserializer {
+            // A newtype struct occupies exactly its inner value's columns, so
+            // the wrapper is invisible on the wire and a reader that is not
+            // asking for one simply sees through it. A reader that *is* asking
+            // never arrives here — `deserialize_newtype_struct` hands it the
+            // wrapper itself.
+            (SchemaNode::NewtypeStruct { inner, .. }, LNode::Newtype(linner)) => {
+                ValueDeserializer {
                     node: inner,
                     lnode: linner,
                     cursors: self.cursors,
                     fast: self.fast,
-                }),
+                }
+                .dispatch(visitor)
+            }
             (SchemaNode::Option(inner), LNode::Option { tag, inner: linner }) => {
                 match self.cursors[*tag].byte()? {
                     0 => visitor.visit_none(),
@@ -747,12 +754,16 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
         }
     }
 
-    /// This value's fields, if the writer's shape is a product (a newtype
+    /// This value's fields, if the writer's shape is a product (a unit, newtype
     /// struct, tuple, tuple struct, or struct). Every product shape is a list
     /// of fields in declaration order, which is what lets one replace another
-    /// between versions.
+    /// between versions — a unit being the empty list, so a type that stored
+    /// nothing can grow fields as long as they have defaults.
     fn product_fields(&self) -> Option<(FieldList<'s>, &'s [LNode])> {
         match (self.node, self.lnode) {
+            (SchemaNode::Unit | SchemaNode::UnitStruct { .. }, LNode::Unit) => {
+                Some((FieldList::Plain(&[]), &[]))
+            }
             (SchemaNode::NewtypeStruct { inner, .. }, LNode::Newtype(linner)) => Some((
                 FieldList::Plain(std::slice::from_ref(&**inner)),
                 std::slice::from_ref(&**linner),
@@ -1005,9 +1016,30 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
             return self.deserialize_shared_wrapper(visitor);
         }
         match self.node {
-            // Same shape: hand it over as a newtype, exactly as before.
-            SchemaNode::NewtypeStruct { .. } => self.dispatch(visitor),
-            _ => self.deserialize_positional(visitor),
+            // Same shape: unwrap one layer and hand the inside to the reader's
+            // own newtype visitor.
+            SchemaNode::NewtypeStruct { inner, .. } => match self.lnode {
+                LNode::Newtype(linner) => visitor.visit_newtype_struct(ValueDeserializer {
+                    node: inner,
+                    lnode: linner,
+                    cursors: self.cursors,
+                    fast: self.fast,
+                }),
+                _ => unreachable!("layout was built from this schema"),
+            },
+            // A product of fields is read positionally, so a one-field writer
+            // lands in the wrapper and any other arity is reported by serde.
+            SchemaNode::Struct { .. }
+            | SchemaNode::Tuple(_)
+            | SchemaNode::TupleStruct { .. }
+            | SchemaNode::Unit
+            | SchemaNode::UnitStruct { .. } => self.deserialize_positional(visitor),
+            // Anything else is a plain value the reader has since wrapped: the
+            // wrapper occupies no columns of its own, so the value goes
+            // straight into it. This is what makes `u32` -> `Layer(u32)` a
+            // compatible change, and — composed with the positional rule —
+            // what lets any field become a named struct.
+            _ => visitor.visit_newtype_struct(self),
         }
     }
 
@@ -1023,7 +1055,26 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
     ) -> Result<V::Value> {
         match self.product_fields() {
             // The writer recorded names; `dispatch` matches on them.
-            Some((FieldList::Named(_), _)) | None => self.dispatch(visitor),
+            Some((FieldList::Named(_), _)) => self.dispatch(visitor),
+            // Not a product at all: a plain value the reader has since
+            // promoted to a struct of its own. It is a one-field product whose
+            // single position is the value itself, so `u32` -> `Layer(u32)` ->
+            // `Layer { id }` composes into `u32` -> `Layer { id }` directly.
+            // Only offered when the reader claims position 0; otherwise this is
+            // an ordinary type mismatch and serde should say so.
+            None if positional_names(fields, 1) => visit_numbered(
+                FieldList::Plain(std::slice::from_ref(self.node)),
+                std::slice::from_ref(self.lnode),
+                self.cursors,
+                self.fast,
+                visitor,
+            ),
+            None => self.dispatch(visitor),
+            // No positions to declare: the writer stored nothing, so every
+            // field the reader has now is missing and falls to its default.
+            Some((positional, lfields)) if positional.len() == 0 => {
+                visit_numbered(positional, lfields, self.cursors, self.fast, visitor)
+            }
             Some((positional, lfields)) => {
                 if positional_names(fields, positional.len()) {
                     visit_numbered(positional, lfields, self.cursors, self.fast, visitor)
@@ -1032,6 +1083,21 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
                 }
             }
         }
+    }
+
+    /// The reader stores nothing here any more. Whatever the writer put in
+    /// this position is skipped, the same as a field the reader has dropped.
+    fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        Self::skip(self.node, self.lnode, self.cursors)?;
+        visitor.visit_unit()
+    }
+
+    fn deserialize_unit_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value> {
+        self.deserialize_unit(visitor)
     }
 
     /// The reader wants positional fields. A writer that recorded names still
@@ -1051,7 +1117,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
 
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf unit unit_struct seq map enum identifier
+        bytes byte_buf seq map enum identifier
     }
 
     fn is_human_readable(&self) -> bool {
@@ -1307,14 +1373,10 @@ impl<'de> EnumAccess<'de> for ColEnum<'_, '_, 'de> {
 impl<'de> VariantAccess<'de> for ColEnum<'_, '_, 'de> {
     type Error = Error;
 
+    /// The reader's variant carries nothing any more, so whatever payload the
+    /// writer stored is skipped — the same as a field the reader has dropped.
     fn unit_variant(self) -> Result<()> {
-        match self.shape {
-            VariantNode::Unit => Ok(()),
-            other => Err(Error::SchemaMismatch {
-                expected: variant_shape_name(other).to_owned(),
-                found: format!("unit variant `{}`", self.name),
-            }),
-        }
+        ValueDeserializer::skip_variant(self.shape, self.lnode, self.cursors)
     }
 
     fn newtype_variant_seed<S: DeserializeSeed<'de>>(self, seed: S) -> Result<S::Value> {
@@ -1372,9 +1434,13 @@ impl<'de> VariantAccess<'de> for ColEnum<'_, '_, 'de> {
             // [`positional_names`].
             _ => match self.payload_fields() {
                 // On the fast path the shapes are identical, so positions
-                // already agree and no declaration is needed.
+                // already agree and no declaration is needed. An empty payload
+                // has no positions to declare either.
                 Some((payload, lfields)) if self.fast => {
                     visit_product(payload, lfields, self.cursors, self.fast, visitor)
+                }
+                Some((payload, lfields)) if payload.len() == 0 => {
+                    visit_numbered(payload, lfields, self.cursors, self.fast, visitor)
                 }
                 Some((payload, lfields)) => {
                     if positional_names(fields, payload.len()) {
@@ -1401,7 +1467,10 @@ impl<'s> ColEnum<'s, '_, '_> {
     /// fields to offer.
     fn payload_fields(&self) -> Option<(FieldList<'s>, &'s [LNode])> {
         match (self.shape, self.lnode) {
-            (VariantNode::Unit, _) => None,
+            // A unit variant is the empty product, so it can grow fields on
+            // the same terms a unit struct can: they are all missing, and each
+            // falls to its `#[serde(default)]`.
+            (VariantNode::Unit, _) => Some((FieldList::Plain(&[]), &[])),
             (VariantNode::Newtype(inner), LNode::Newtype(linner)) => Some((
                 FieldList::Plain(std::slice::from_ref(&**inner)),
                 std::slice::from_ref(&**linner),

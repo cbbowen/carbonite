@@ -133,7 +133,8 @@ Every row below is a test in `tests/evolution.rs` or `tests/shape_evolution.rs`.
 | Wrap a field in `Option` | ✓ | — (old values read as `Some`) |
 | Unwrap an `Option` | ✗ | |
 | Change a field's type | ✗ | |
-| Wrap a field's type in a newtype struct | ✗ | |
+| Wrap a field's type in a newtype struct, or unwrap it | ✓ | — |
+| Promote a field to a named struct of its own | ✓ | `#[serde(alias = "0")]` on the field that takes its place |
 
 **Enum variants**
 
@@ -144,16 +145,19 @@ Every row below is a test in `tests/evolution.rs` or `tests/shape_evolution.rs`.
 | Rename a variant | ✓ | `#[serde(alias = "Old")]` |
 | Remove a variant | ✓ | — (data that used it is reported) |
 | Add or remove a variant's fields | ✓ | as for struct fields |
-| Give a unit variant a payload, or take one away | ✗ | |
+| Give a unit variant *named* fields | ✓ | `#[serde(default)]` on each |
+| Take a variant's payload away | ✓ | — (it is skipped) |
+| Give a unit variant a one-field tuple payload | ✗ | use a struct variant |
 
 The tag on the wire indexes the *writer's* variant list and is resolved to a name before
 matching, so where a variant sits is not part of the contract.
 
 **Positional and named field groups**
 
-A tuple, tuple struct, tuple variant, and newtype are all a product of fields in declaration
-order, so they can become named ones — but only if the reader says which position each field
-replaces:
+Every shape is a product of fields in declaration order — a unit is the empty product, a
+newtype the one-element one, a tuple or struct the rest — so each can become another. Moving
+to *named* fields is the one case that needs saying out loud: the reader has to declare which
+position each field replaces.
 
 ```rust
 use serde::{Serialize, Deserialize};
@@ -174,14 +178,47 @@ let point: Point = carbonite::from_slice(&old_file).unwrap();
 assert_eq!(point, Point { y: 2.0, x: 1.0 });
 ```
 
+Because a newtype wrapper is invisible on the wire, that composes into a way to promote *any*
+field to a struct of its own — `u32` → `Layer(u32)` → `Layer { id: u32 }` — and a file
+predating the whole chain still reads:
+
+```rust
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, carbonite::Schema)]
+struct SettingsV1 {
+    volume: u32,
+}
+
+#[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug)]
+struct Channel {
+    #[serde(alias = "0")]
+    level: u32,
+    #[serde(default)]
+    muted: bool,
+}
+
+#[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug)]
+struct Settings {
+    volume: Channel,
+}
+
+let v1_file = carbonite::to_vec(&SettingsV1 { volume: 11 }).unwrap();
+let settings: Settings = carbonite::from_slice(&v1_file).unwrap();
+assert_eq!(settings, Settings { volume: Channel { level: 11, muted: false } });
+```
+
 | Change | | Needs |
 | --- | --- | --- |
 | Tuple struct or tuple variant → named fields | ✓ | `#[serde(alias = "0")]`, … |
 | Newtype struct or variant → named fields | ✓ | `#[serde(alias = "0")]` |
+| A plain value → named fields | ✓ | `#[serde(alias = "0")]` |
+| A unit or unit struct → named fields | ✓ | `#[serde(default)]` on each |
 | Named fields → tuple, tuple struct, or newtype | ✗ | |
 | Grow a tuple struct or tuple variant | ✓ | `#[serde(default)]` on the new field |
 | Grow a bare `(A, B)` tuple | ✗ | use a tuple struct |
 | Shrink any of them | ✓ | — |
+| Anything → a reader that stores `()` here | ✓ | — (the value is skipped) |
 
 Without the tags the change is refused rather than matched by declaration order, because that
 would not **compose**: reordering named fields is already a no-op, so `V0(f32, f32)` →

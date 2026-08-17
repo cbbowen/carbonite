@@ -365,11 +365,10 @@ fn an_older_reader_skips_a_field_it_does_not_know() {
     );
 }
 
-/// Wrapping a field's type in a newtype struct is a no-op on the wire — a
-/// `NewtypeStruct` occupies exactly its inner value's columns — but is not
-/// currently reconciled in either direction.
+/// A newtype struct occupies exactly its inner value's columns, so the wrapper
+/// is invisible on the wire and can be put on or taken off freely.
 #[test]
-fn wrapping_a_field_in_a_newtype_is_not_supported() {
+fn a_fields_type_can_gain_or_lose_a_newtype_wrapper() {
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct Meters(u32);
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -381,19 +380,103 @@ fn wrapping_a_field_in_a_newtype_is_not_supported() {
         d: Meters,
     }
 
-    assert!(migrate::<_, Wrapped>(&Plain { d: 5 }).is_err());
-    assert!(migrate::<_, Plain>(&Wrapped { d: Meters(5) }).is_err());
+    assert_eq!(
+        migrate::<_, Wrapped>(&Plain { d: 5 }).unwrap(),
+        Wrapped { d: Meters(5) }
+    );
+    assert_eq!(
+        migrate::<_, Plain>(&Wrapped { d: Meters(5) }).unwrap(),
+        Plain { d: 5 }
+    );
 }
 
+/// Composed with the positional rule, that makes *any* field promotable to a
+/// struct of its own: wrap it, then name the position.
 #[test]
-fn a_unit_struct_and_an_empty_struct_are_not_interchangeable() {
+fn any_field_can_become_a_struct() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct V0 {
+        d: u32,
+    }
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Layer1(u32);
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct V1 {
+        d: Layer1,
+    }
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Layer2 {
+        #[serde(alias = "0")]
+        id: u32,
+    }
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct V2 {
+        d: Layer2,
+    }
+
+    // Each step in turn...
+    assert_eq!(migrate::<_, V1>(&V0 { d: 5 }).unwrap(), V1 { d: Layer1(5) });
+    assert_eq!(
+        migrate::<_, V2>(&V1 { d: Layer1(5) }).unwrap(),
+        V2 {
+            d: Layer2 { id: 5 }
+        }
+    );
+    // ...and the whole way, from a file that predates both.
+    assert_eq!(
+        migrate::<_, V2>(&V0 { d: 5 }).unwrap(),
+        V2 {
+            d: Layer2 { id: 5 }
+        }
+    );
+}
+
+/// A unit is the empty product, so a type that stored nothing can grow fields
+/// — in one step, not two, since the fields are simply all missing.
+#[test]
+fn a_unit_can_grow_fields() {
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct Unit;
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct Empty {}
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Grown {
+        #[serde(default)]
+        field: u32,
+    }
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct GrownWithoutDefault {
+        field: u32,
+    }
 
-    assert!(migrate::<_, Empty>(&Unit).is_err());
-    assert!(migrate::<_, Unit>(&Empty {}).is_err());
+    assert_eq!(migrate::<_, Empty>(&Unit).unwrap(), Empty {});
+    assert_eq!(migrate::<_, Grown>(&Empty {}).unwrap(), Grown { field: 0 });
+    assert_eq!(migrate::<_, Grown>(&Unit).unwrap(), Grown { field: 0 });
+    // The added field still needs a default, as anywhere else.
+    let err = migrate::<_, GrownWithoutDefault>(&Unit).unwrap_err();
+    assert!(err.to_string().contains("field"), "{err}");
+}
+
+/// And the reverse: a reader that no longer stores anything here skips
+/// whatever the writer put in its place, exactly as it would a dropped field.
+#[test]
+fn a_reader_that_stores_nothing_skips_the_writers_value() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Unit;
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Populated {
+        a: u32,
+        b: String,
+    }
+
+    assert_eq!(
+        migrate::<_, Unit>(&Populated {
+            a: 1,
+            b: "x".to_owned()
+        })
+        .unwrap(),
+        Unit
+    );
 }
 
 // --- enum variants ---------------------------------------------------------
@@ -499,19 +582,44 @@ fn an_older_reader_reports_a_variant_it_does_not_know() {
     assert!(err.to_string().contains("Wand"), "{err}");
 }
 
-/// A variant may gain or lose *fields*, but not change between having a
-/// payload and not having one: a unit variant stores no columns to read a
-/// payload from, and `#[serde(default)]` has no say in it.
+/// A unit variant is the empty product, like a unit struct, so it can grow
+/// *named* fields — every one is missing and falls to its default — and a
+/// variant that has lost its payload skips whatever the writer stored.
 #[test]
-fn a_variant_cannot_gain_or_lose_its_payload() {
+fn a_unit_variant_can_grow_named_fields() {
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     enum Unit {
         A,
         B,
     }
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    enum Grown {
+        A {
+            #[serde(default)]
+            v: u8,
+        },
+        B,
+    }
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
     enum Newtype {
         A(u8),
+        B,
+    }
+
+    assert_eq!(migrate::<_, Grown>(&Unit::A).unwrap(), Grown::A { v: 0 });
+    assert_eq!(migrate::<_, Unit>(&Newtype::A(3)).unwrap(), Unit::A);
+    assert_eq!(migrate::<_, Unit>(&Grown::A { v: 3 }).unwrap(), Unit::A);
+}
+
+/// A *newtype* variant is the one place this does not reach: serde reads it
+/// through `newtype_variant_seed`, which has no way to supply a default, so
+/// there is nothing to give the single field when the writer stored nothing.
+/// Use a struct variant if the payload has to be able to appear later.
+#[test]
+fn a_unit_variant_cannot_grow_a_newtype_payload() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    enum Unit {
+        A,
         B,
     }
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -520,9 +628,7 @@ fn a_variant_cannot_gain_or_lose_its_payload() {
         B,
     }
 
-    assert!(migrate::<_, Newtype>(&Unit::A).is_err());
     assert!(migrate::<_, Defaulted>(&Unit::A).is_err());
-    assert!(migrate::<_, Unit>(&Newtype::A(3)).is_err());
 }
 
 // --- containers ------------------------------------------------------------
