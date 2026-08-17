@@ -123,6 +123,61 @@
 //! # Ok::<(), carbonite::Error>(())
 //! ```
 //!
+//! # Fields whose types come from another crate
+//!
+//! `#[derive(Schema)]` needs a compile-time schema for every field type, which
+//! the orphan rule makes impossible for a foreign type from a crate that only
+//! ships serde impls. Mark such a field `#[carbonite(serde)]`: its schema comes
+//! from a runtime trace of the field type, and its data goes through the serde
+//! path, into that field's own columns.
+//!
+//! ```
+//! use serde::{Serialize, Deserialize};
+//!
+//! // Imagine this type comes from another crate: serde impls, and no way for
+//! // you to add a carbonite impl for it.
+//! #[derive(Serialize, Deserialize, PartialEq, Debug)]
+//! struct EndpointAddr {
+//!     id: [u8; 4],
+//!     relay: Option<String>,
+//! }
+//!
+//! #[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug)]
+//! struct Peer {
+//!     id: u64,
+//!     #[carbonite(serde)]
+//!     addr: EndpointAddr,
+//!     label: String,
+//! }
+//!
+//! let peer = Peer {
+//!     id: 7,
+//!     addr: EndpointAddr { id: [192, 0, 2, 1], relay: Some("eu-west".to_owned()) },
+//!     label: "peer-7".to_owned(),
+//! };
+//! let bytes = carbonite::to_vec_static(&peer)?;
+//! assert_eq!(carbonite::from_slice_static::<Peer>(&bytes)?, peer);
+//!
+//! // Nothing about the encoding changes: the field keeps the columns and bytes
+//! // it would have had if the whole type had been traced, so the derived
+//! // schema still equals the traced one.
+//! use carbonite::StaticSchema;
+//! assert_eq!(Peer::schema(), carbonite::Schema::<Peer>::new()?);
+//! # Ok::<(), carbonite::Error>(())
+//! ```
+//!
+//! Because the schema still describes the field in full, evolution and
+//! schema-only readers keep working across it, and a reader needs no knowledge
+//! that the attribute was used. Only that field pays serde dispatch; the rest
+//! of the type keeps the monomorphized path.
+//!
+//! A fallback field's type must be `DeserializeOwned + 'static` (tracing reads
+//! its `Deserialize` impl, so it cannot borrow from the input even though the
+//! rest of the type still can) and must be traceable. An untraceable one —
+//! untagged enums, `#[serde(flatten)]` — panics the first time the schema is
+//! built, since traceability is a property of the type rather than of any
+//! value.
+//!
 //! # Shared values
 //!
 //! serde's tree-shaped data model serializes an `Rc`/`Arc` pointee once per
@@ -204,6 +259,8 @@ struct ReadmeDoctests;
 pub mod columnar;
 mod de;
 mod error;
+#[doc(hidden)]
+pub mod fallback;
 mod layout;
 mod schema;
 mod self_describing;
@@ -237,9 +294,16 @@ pub use schema::{Primitive, SchemaNode, VariantNode};
 ///
 /// It honors the serde attributes that affect wire shape (`rename`,
 /// `rename_all`, `rename_all_fields`, `skip`, `transparent`) and rejects, at
-/// compile time, the ones carbonite cannot represent. Use
-/// `#[carbonite(crate = "...")]` to point the generated code at a renamed
-/// carbonite dependency.
+/// compile time, the ones carbonite cannot represent.
+///
+/// Two attributes of its own:
+///
+/// - `#[carbonite(crate = "...")]` on the container points the generated code
+///   at a renamed carbonite dependency.
+/// - `#[carbonite(serde)]` on a field takes that field's schema from a runtime
+///   trace and routes its data through the serde path, which is what lets a
+///   derived type hold [foreign types](crate#fields-whose-types-come-from-another-crate)
+///   that only ship serde impls.
 ///
 /// The name is the same namespace trick serde uses: `Schema` is both this
 /// derive macro and the [`struct@Schema`] type.

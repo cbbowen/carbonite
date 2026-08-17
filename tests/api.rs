@@ -28,15 +28,15 @@ fn readings(n: u16) -> Vec<Reading> {
 // Trait shape.
 // ---------------------------------------------------------------------------
 
-/// `COLUMNS` lives on `StaticSchema` alone. When both columnar traits
-/// declared their own, `T::COLUMNS` was ambiguous (E0034) and the two could
+/// The column count lives on `StaticSchema` alone. When both columnar traits
+/// declared their own, `T::columns()` was ambiguous (E0034) and the two could
 /// silently disagree about a type's layout.
 #[test]
 fn columns_is_declared_once() {
-    assert_eq!(Reading::COLUMNS, 2);
-    assert_eq!(<Vec<Reading>>::COLUMNS, 3);
-    assert_eq!(<Option<String>>::COLUMNS, 3);
-    assert_eq!(<()>::COLUMNS, 0);
+    assert_eq!(Reading::columns(), 2);
+    assert_eq!(<Vec<Reading>>::columns(), 3);
+    assert_eq!(<Option<String>>::columns(), 3);
+    assert_eq!(<()>::columns(), 0);
 }
 
 #[test]

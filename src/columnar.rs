@@ -6,13 +6,17 @@
 //! value. Implementations come from `#[derive(Schema)]`; the impls in this
 //! module cover primitives and std containers.
 //!
+//! The one exception is a field marked `#[carbonite(serde)]`, whose width is
+//! only known at runtime and whose value routes back through the serde path;
+//! every other field in the same type keeps its folded offsets.
+//!
 //! The fast path only applies when the wire schema equals the type's own
 //! [`StaticSchema`]; for any other schema (older files, foreign writers),
 //! use the serde path, which handles evolution.
 //!
 //! Both traits take their column count from
-//! [`StaticSchema::COLUMNS`](StaticSchema#associatedconstant.COLUMNS), so the
-//! read and write directions cannot disagree about a type's layout.
+//! [`StaticSchema::columns`], so the read and write directions cannot disagree
+//! about a type's layout.
 //!
 //! # Contract for manual implementations
 //!
@@ -21,7 +25,7 @@
 //! `Deserialize` impls, over the column layout of the type's
 //! [`StaticSchema::schema_node`]: columns are assigned depth-first, a node's
 //! own columns (lengths, presence bytes, tags) before its children's. The
-//! column slice passed to each call is exactly `Self::COLUMNS` long.
+//! column slice passed to each call is exactly `Self::columns()` long.
 //!
 //! Any length or count read from the input must be passed through
 //! [`checked_count`] before it is used to size an allocation or drive a loop.
@@ -237,7 +241,7 @@ fn read_count<T: ?Sized + StaticSchema>(
     elements: &[ColumnCursor<'_>],
 ) -> Result<usize> {
     let claimed = len_column.varint()?;
-    checked_count(what, T::COLUMNS, claimed, elements)
+    checked_count(what, T::columns(), claimed, elements)
 }
 
 /// Writes `self`'s leaves directly into column buffers.
@@ -246,7 +250,7 @@ fn read_count<T: ?Sized + StaticSchema>(
 /// `#[derive(Schema)]`.
 pub trait SerializeColumns: StaticSchema {
     /// Appends one value to `columns`, which is exactly
-    /// [`Self::COLUMNS`](StaticSchema#associatedconstant.COLUMNS) long.
+    /// [`Self::columns()`](StaticSchema::columns) long.
     ///
     /// # Errors
     ///
@@ -261,7 +265,7 @@ pub trait SerializeColumns: StaticSchema {
 /// `#[derive(Schema)]`.
 pub trait DeserializeColumns<'de>: StaticSchema + Sized {
     /// Reads one value from `cursors`, which is exactly
-    /// [`Self::COLUMNS`](StaticSchema#associatedconstant.COLUMNS) long.
+    /// [`Self::columns()`](StaticSchema::columns) long.
     ///
     /// # Errors
     ///
@@ -517,7 +521,7 @@ impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for Vec<T> {
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         let (len_column, elems) = cursors.split_at_mut(1);
         let len = read_count::<T>("sequence length", &mut len_column[0], elems)?;
-        let mut out = Vec::with_capacity(cautious_capacity(T::COLUMNS, len));
+        let mut out = Vec::with_capacity(cautious_capacity(T::columns(), len));
         for _ in 0..len {
             out.push(T::deserialize_columns(&mut *elems)?);
         }
@@ -584,7 +588,7 @@ impl<T: SerializeColumns, const N: usize> SerializeColumns for [T; N] {
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         let mut rest = columns;
         for item in self {
-            item.serialize_columns(__split(&mut rest, T::COLUMNS))?;
+            item.serialize_columns(__split(&mut rest, T::columns()))?;
         }
         Ok(())
     }
@@ -600,7 +604,7 @@ impl<'de, T: DeserializeColumns<'de>, const N: usize> DeserializeColumns<'de> fo
             if first_error.is_some() {
                 return None;
             }
-            match T::deserialize_columns(__split(&mut rest, T::COLUMNS)) {
+            match T::deserialize_columns(__split(&mut rest, T::columns())) {
                 Ok(item) => Some(item),
                 Err(err) => {
                     first_error = Some(err);
@@ -621,7 +625,7 @@ macro_rules! tuple_columns {
             fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
                 let mut rest = columns;
                 $(
-                    self.$idx.serialize_columns(__split(&mut rest, $name::COLUMNS))?;
+                    self.$idx.serialize_columns(__split(&mut rest, $name::columns()))?;
                 )+
                 Ok(())
             }
@@ -631,7 +635,7 @@ macro_rules! tuple_columns {
             fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
                 let mut rest = cursors;
                 Ok(($(
-                    $name::deserialize_columns(__split(&mut rest, $name::COLUMNS))?,
+                    $name::deserialize_columns(__split(&mut rest, $name::columns()))?,
                 )+))
             }
         }
@@ -660,7 +664,7 @@ tuple_columns! {
 impl<K: SerializeColumns, V: SerializeColumns, S> SerializeColumns for HashMap<K, V, S> {
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         write_varint(&mut columns[0], self.len() as u64);
-        let (keys, values) = columns[1..].split_at_mut(K::COLUMNS);
+        let (keys, values) = columns[1..].split_at_mut(K::columns());
         for (key, value) in self {
             key.serialize_columns(&mut *keys)?;
             value.serialize_columns(&mut *values)?;
@@ -672,7 +676,7 @@ impl<K: SerializeColumns, V: SerializeColumns, S> SerializeColumns for HashMap<K
 impl<K: SerializeColumns, V: SerializeColumns> SerializeColumns for BTreeMap<K, V> {
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         write_varint(&mut columns[0], self.len() as u64);
-        let (keys, values) = columns[1..].split_at_mut(K::COLUMNS);
+        let (keys, values) = columns[1..].split_at_mut(K::columns());
         for (key, value) in self {
             key.serialize_columns(&mut *keys)?;
             value.serialize_columns(&mut *values)?;
@@ -689,8 +693,8 @@ where
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         let (len_column, entries) = cursors.split_at_mut(1);
         let claimed = len_column[0].varint()?;
-        let len = checked_count("map length", K::COLUMNS + V::COLUMNS, claimed, entries)?;
-        let (keys, values) = entries.split_at_mut(K::COLUMNS);
+        let len = checked_count("map length", K::columns() + V::columns(), claimed, entries)?;
+        let (keys, values) = entries.split_at_mut(K::columns());
         (0..len)
             .map(|_| {
                 Ok((
@@ -711,8 +715,8 @@ where
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         let (len_column, entries) = cursors.split_at_mut(1);
         let claimed = len_column[0].varint()?;
-        let len = checked_count("map length", K::COLUMNS + V::COLUMNS, claimed, entries)?;
-        let (keys, values) = entries.split_at_mut(K::COLUMNS);
+        let len = checked_count("map length", K::columns() + V::columns(), claimed, entries)?;
+        let (keys, values) = entries.split_at_mut(K::columns());
         (0..len)
             .map(|_| {
                 Ok((
@@ -774,11 +778,11 @@ impl<T: SerializeColumns, E: SerializeColumns> SerializeColumns for Result<T, E>
         match self {
             Ok(value) => {
                 write_varint(&mut columns[0], 0);
-                value.serialize_columns(&mut columns[1..1 + T::COLUMNS])
+                value.serialize_columns(&mut columns[1..1 + T::columns()])
             }
             Err(err) => {
                 write_varint(&mut columns[0], 1);
-                err.serialize_columns(&mut columns[1 + T::COLUMNS..])
+                err.serialize_columns(&mut columns[1 + T::columns()..])
             }
         }
     }
@@ -789,8 +793,8 @@ impl<'de, T: DeserializeColumns<'de>, E: DeserializeColumns<'de>> DeserializeCol
 {
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         match cursors[0].varint()? {
-            0 => Ok(Ok(T::deserialize_columns(&mut cursors[1..1 + T::COLUMNS])?)),
-            1 => Ok(Err(E::deserialize_columns(&mut cursors[1 + T::COLUMNS..])?)),
+            0 => Ok(Ok(T::deserialize_columns(&mut cursors[1..1 + T::columns()])?)),
+            1 => Ok(Err(E::deserialize_columns(&mut cursors[1 + T::columns()..])?)),
             tag => Err(__invalid_variant(tag)),
         }
     }

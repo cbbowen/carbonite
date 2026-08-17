@@ -25,6 +25,8 @@ self-describing format with the size and speed of a binary one:
   parity on deserialization.
 - **Identity-aware**: `Shared<T>`/`SharedArc<T>` write each unique `Rc`/`Arc` object once
   and rebuild real pointer sharing on read.
+- **Ecosystem-friendly**: `#[carbonite(serde)]` lets a derived type hold fields whose types
+  come from crates that only ship serde impls, with no change to the encoding.
 - **Safe on untrusted input**: every count a blob claims is validated against the bytes it
   actually carries, so decoding work stays proportional to the input.
 
@@ -111,6 +113,47 @@ let old_file = carbonite::to_vec(&SaveV1 { name: "Ada".into(), hp: 90 }).unwrap(
 let save: Save = carbonite::from_slice(&old_file).unwrap();
 assert_eq!(save, Save { title: "Ada".into(), hp: 90, mana: 0 });
 ```
+
+## Fields from crates that only know serde
+
+`#[derive(Schema)]` needs a compile-time schema for every field type — which the orphan rule
+puts out of reach for a foreign type whose crate ships serde impls and nothing else. Mark the
+field `#[carbonite(serde)]`: its schema comes from a runtime trace of the field type, and its
+data goes through the serde path, into that field's own columns.
+
+```rust
+use serde::{Serialize, Deserialize};
+
+// Imagine this type is from another crate: serde impls, and no way for you to
+// add a carbonite impl for it.
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct EndpointAddr {
+    id: [u8; 4],
+    relay: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug)]
+struct Peer {
+    id: u64,
+    #[carbonite(serde)]
+    addr: EndpointAddr,
+    label: String,
+}
+
+let peer = Peer {
+    id: 7,
+    addr: EndpointAddr { id: [192, 0, 2, 1], relay: Some("eu-west".into()) },
+    label: "peer-7".into(),
+};
+let bytes = carbonite::to_vec_static(&peer).unwrap();
+assert_eq!(carbonite::from_slice_static::<Peer>(&bytes).unwrap(), peer);
+```
+
+Nothing about the encoding changes: the field keeps the columns and bytes it would have had if
+the whole type had been traced, so the schema still describes it in full, evolution still
+works across it, and a reader needs no idea the attribute was used. Only that field pays serde
+dispatch — the rest of the type keeps the monomorphized path. The field type must be
+`DeserializeOwned + 'static` and traceable.
 
 ## Shared values, written once
 

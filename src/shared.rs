@@ -156,7 +156,10 @@ macro_rules! shared_wrapper {
             fn schema_node() -> SchemaNode {
                 SchemaNode::Shared(Box::new(T::schema_node()))
             }
-            const COLUMNS: usize = 1 + T::COLUMNS;
+            #[inline]
+            fn columns() -> usize {
+                1 + T::columns()
+            }
         }
     };
 }

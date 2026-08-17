@@ -287,6 +287,26 @@ impl<T: ?Sized> fmt::Debug for Batch<'_, T> {
     }
 }
 
+/// Serializes one value into `columns` (exactly the columns of `node`, in
+/// layout order) through the schema-driven serde path.
+///
+/// The column slice is addressed relative to its own start, so this can be
+/// pointed at a subrange of a larger row — which is how a
+/// `#[carbonite(serde)]` field is written from inside the columnar fast path
+/// (see [`crate::fallback`]).
+pub(crate) fn serialize_value<T: Serialize + ?Sized>(
+    value: &T,
+    node: &SchemaNode,
+    lnode: &LNode,
+    columns: &mut [Vec<u8>],
+) -> Result<()> {
+    value.serialize(ValueSerializer {
+        node,
+        lnode,
+        columns,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // The serde::Serializer implementation.
 // ---------------------------------------------------------------------------
@@ -296,7 +316,7 @@ impl<T: ?Sized> fmt::Debug for Batch<'_, T> {
 struct ValueSerializer<'a, 'c> {
     node: &'a SchemaNode,
     lnode: &'a LNode,
-    columns: &'c mut Vec<Vec<u8>>,
+    columns: &'c mut [Vec<u8>],
 }
 
 impl ValueSerializer<'_, '_> {
@@ -746,7 +766,7 @@ pub(crate) struct SeqSerializer<'a, 'c> {
     elem: &'a SchemaNode,
     lelem: &'a LNode,
     len_col: ColId,
-    columns: &'c mut Vec<Vec<u8>>,
+    columns: &'c mut [Vec<u8>],
     count: u64,
 }
 
@@ -774,7 +794,7 @@ impl ser::SerializeSeq for SeqSerializer<'_, '_> {
 pub(crate) struct ProductSerializer<'a, 'c> {
     fields: &'a [SchemaNode],
     lfields: &'a [LNode],
-    columns: &'c mut Vec<Vec<u8>>,
+    columns: &'c mut [Vec<u8>],
     index: usize,
 }
 
@@ -847,7 +867,7 @@ impl ser::SerializeTupleVariant for ProductSerializer<'_, '_> {
 pub(crate) struct StructSerializer<'a, 'c> {
     fields: &'a [(String, SchemaNode)],
     lfields: &'a [LNode],
-    columns: &'c mut Vec<Vec<u8>>,
+    columns: &'c mut [Vec<u8>],
     index: usize,
 }
 
@@ -939,7 +959,7 @@ pub(crate) struct MapSerializer<'a, 'c> {
     value: &'a SchemaNode,
     lvalue: &'a LNode,
     len_col: ColId,
-    columns: &'c mut Vec<Vec<u8>>,
+    columns: &'c mut [Vec<u8>],
     count: u64,
     awaiting_value: bool,
 }

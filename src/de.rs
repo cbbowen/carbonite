@@ -378,6 +378,28 @@ fn key_deserializer(key: &str) -> StrDeserializer<'_, Error> {
     StrDeserializer::new(key)
 }
 
+/// Reads one value out of `cursors` (exactly the columns of `node`, in layout
+/// order) through the schema-driven serde path.
+///
+/// The cursor slice is addressed relative to its own start, so this can be
+/// pointed at a subrange of a larger row — which is how a
+/// `#[carbonite(serde)]` field is read from inside the columnar fast path (see
+/// [`crate::fallback`]). `fast` selects positional struct decoding, which is
+/// correct exactly when `node` came from the reading type itself.
+pub(crate) fn deserialize_value<'de, T: Deserialize<'de>>(
+    node: &SchemaNode,
+    lnode: &LNode,
+    cursors: &mut [Cursor<'de>],
+    fast: bool,
+) -> Result<T> {
+    T::deserialize(ValueDeserializer {
+        node,
+        lnode,
+        cursors,
+        fast,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // The serde::Deserializer implementation.
 // ---------------------------------------------------------------------------
@@ -386,7 +408,7 @@ fn key_deserializer(key: &str) -> StrDeserializer<'_, Error> {
 struct ValueDeserializer<'s, 'c, 'de> {
     node: &'s SchemaNode,
     lnode: &'s LNode,
-    cursors: &'c mut Vec<Cursor<'de>>,
+    cursors: &'c mut [Cursor<'de>],
     fast: bool,
 }
 
@@ -827,7 +849,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
 struct ColSeq<'s, 'c, 'de> {
     node: &'s SchemaNode,
     lnode: &'s LNode,
-    cursors: &'c mut Vec<Cursor<'de>>,
+    cursors: &'c mut [Cursor<'de>],
     remaining: u64,
     fast: bool,
 }
@@ -879,7 +901,7 @@ impl<'s> FieldList<'s> {
 struct FieldsSeq<'s, 'c, 'de> {
     fields: FieldList<'s>,
     lfields: &'s [LNode],
-    cursors: &'c mut Vec<Cursor<'de>>,
+    cursors: &'c mut [Cursor<'de>],
     index: usize,
     fast: bool,
 }
@@ -915,7 +937,7 @@ impl<'de> SeqAccess<'de> for FieldsSeq<'_, '_, 'de> {
 struct StructMap<'s, 'c, 'de> {
     fields: &'s [(String, SchemaNode)],
     lfields: &'s [LNode],
-    cursors: &'c mut Vec<Cursor<'de>>,
+    cursors: &'c mut [Cursor<'de>],
     index: usize,
     fast: bool,
 }
@@ -957,7 +979,7 @@ struct ColMap<'s, 'c, 'de> {
     lkey: &'s LNode,
     value: &'s SchemaNode,
     lvalue: &'s LNode,
-    cursors: &'c mut Vec<Cursor<'de>>,
+    cursors: &'c mut [Cursor<'de>],
     remaining: u64,
     awaiting_value: bool,
     fast: bool,
@@ -1003,7 +1025,7 @@ struct ColEnum<'s, 'c, 'de> {
     name: &'s str,
     shape: &'s VariantNode,
     lnode: &'s LNode,
-    cursors: &'c mut Vec<Cursor<'de>>,
+    cursors: &'c mut [Cursor<'de>],
     fast: bool,
 }
 

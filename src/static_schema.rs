@@ -16,8 +16,8 @@ use crate::schema::{Primitive, Schema, SchemaNode, VariantNode};
 /// types that borrow from their input.
 ///
 /// [`StaticSchema::schema`] is the method you call. The rest of the trait —
-/// the schema tree and the column-layout constants — is carbonite's internal
-/// surface, shared by the [`SerializeColumns`](crate::SerializeColumns) and
+/// the schema tree and the column count — is carbonite's internal surface,
+/// shared by the [`SerializeColumns`](crate::SerializeColumns) and
 /// [`DeserializeColumns`](crate::DeserializeColumns) fast paths so the two
 /// directions can never disagree about a type's layout.
 ///
@@ -45,8 +45,14 @@ pub trait StaticSchema {
     fn schema_node() -> SchemaNode;
 
     /// Number of columns this type's schema occupies. Internal.
+    ///
+    /// A function rather than an associated constant because a field marked
+    /// `#[carbonite(serde)]` takes its schema from a runtime trace of the
+    /// field type, so any type containing one has a column count that is not
+    /// a constant expression. Every implementation here is a chain of
+    /// `#[inline]` literals, so the common case still folds to a constant.
     #[doc(hidden)]
-    const COLUMNS: usize;
+    fn columns() -> usize;
 
     /// `Some(width)` iff this type is a single fixed-width column, which lets
     /// sequences bulk-reserve. Internal.
@@ -66,7 +72,10 @@ macro_rules! primitive_impls {
             fn schema_node() -> SchemaNode {
                 SchemaNode::Primitive(Primitive::$prim)
             }
-            const COLUMNS: usize = 1;
+            #[inline]
+            fn columns() -> usize {
+                1
+            }
             const FIXED_WIDTH: Option<usize> = Some($width);
         }
     )*};
@@ -108,28 +117,40 @@ impl StaticSchema for () {
     fn schema_node() -> SchemaNode {
         SchemaNode::Unit
     }
-    const COLUMNS: usize = 0;
+    #[inline]
+    fn columns() -> usize {
+        0
+    }
 }
 
 impl StaticSchema for String {
     fn schema_node() -> SchemaNode {
         SchemaNode::String
     }
-    const COLUMNS: usize = 2;
+    #[inline]
+    fn columns() -> usize {
+        2
+    }
 }
 
 impl StaticSchema for str {
     fn schema_node() -> SchemaNode {
         SchemaNode::String
     }
-    const COLUMNS: usize = 2;
+    #[inline]
+    fn columns() -> usize {
+        2
+    }
 }
 
 impl<T: StaticSchema> StaticSchema for Option<T> {
     fn schema_node() -> SchemaNode {
         SchemaNode::Option(Box::new(T::schema_node()))
     }
-    const COLUMNS: usize = 1 + T::COLUMNS;
+    #[inline]
+    fn columns() -> usize {
+        1 + T::columns()
+    }
 }
 
 macro_rules! seq_impls {
@@ -138,7 +159,10 @@ macro_rules! seq_impls {
             fn schema_node() -> SchemaNode {
                 SchemaNode::Seq(Box::new(T::schema_node()))
             }
-            const COLUMNS: usize = 1 + T::COLUMNS;
+            #[inline]
+            fn columns() -> usize {
+                1 + T::columns()
+            }
         }
     )*};
 }
@@ -155,7 +179,10 @@ impl<T: StaticSchema, S> StaticSchema for HashSet<T, S> {
     fn schema_node() -> SchemaNode {
         SchemaNode::Seq(Box::new(T::schema_node()))
     }
-    const COLUMNS: usize = 1 + T::COLUMNS;
+    #[inline]
+    fn columns() -> usize {
+        1 + T::columns()
+    }
 }
 
 impl<T: StaticSchema, const N: usize> StaticSchema for [T; N] {
@@ -163,7 +190,10 @@ impl<T: StaticSchema, const N: usize> StaticSchema for [T; N] {
         // serde treats arrays as N-tuples.
         SchemaNode::Tuple(vec![T::schema_node(); N])
     }
-    const COLUMNS: usize = N * T::COLUMNS;
+    #[inline]
+    fn columns() -> usize {
+        N * T::columns()
+    }
 }
 
 impl<K: StaticSchema, V: StaticSchema, S> StaticSchema for HashMap<K, V, S> {
@@ -173,7 +203,10 @@ impl<K: StaticSchema, V: StaticSchema, S> StaticSchema for HashMap<K, V, S> {
             value: Box::new(V::schema_node()),
         }
     }
-    const COLUMNS: usize = 1 + K::COLUMNS + V::COLUMNS;
+    #[inline]
+    fn columns() -> usize {
+        1 + K::columns() + V::columns()
+    }
 }
 
 impl<K: StaticSchema, V: StaticSchema> StaticSchema for BTreeMap<K, V> {
@@ -183,7 +216,10 @@ impl<K: StaticSchema, V: StaticSchema> StaticSchema for BTreeMap<K, V> {
             value: Box::new(V::schema_node()),
         }
     }
-    const COLUMNS: usize = 1 + K::COLUMNS + V::COLUMNS;
+    #[inline]
+    fn columns() -> usize {
+        1 + K::columns() + V::columns()
+    }
 }
 
 macro_rules! tuple_impls {
@@ -192,7 +228,10 @@ macro_rules! tuple_impls {
             fn schema_node() -> SchemaNode {
                 SchemaNode::Tuple(vec![$(<$name>::schema_node()),+])
             }
-            const COLUMNS: usize = 0 $(+ $name::COLUMNS)+;
+            #[inline]
+            fn columns() -> usize {
+                0 $(+ $name::columns())+
+            }
         }
     )*};
 }
@@ -222,7 +261,10 @@ macro_rules! transparent_impls {
             fn schema_node() -> SchemaNode {
                 T::schema_node()
             }
-            const COLUMNS: usize = T::COLUMNS;
+            #[inline]
+            fn columns() -> usize {
+                T::columns()
+            }
             const FIXED_WIDTH: Option<usize> = T::FIXED_WIDTH;
         }
     )*};
@@ -234,7 +276,10 @@ impl<T: StaticSchema + ToOwned + ?Sized> StaticSchema for Cow<'_, T> {
     fn schema_node() -> SchemaNode {
         T::schema_node()
     }
-    const COLUMNS: usize = T::COLUMNS;
+    #[inline]
+    fn columns() -> usize {
+        T::columns()
+    }
     const FIXED_WIDTH: Option<usize> = T::FIXED_WIDTH;
 }
 
@@ -254,7 +299,10 @@ impl<T: StaticSchema, E: StaticSchema> StaticSchema for Result<T, E> {
             ],
         }
     }
-    const COLUMNS: usize = 1 + T::COLUMNS + E::COLUMNS;
+    #[inline]
+    fn columns() -> usize {
+        1 + T::columns() + E::columns()
+    }
 }
 
 impl<T: ?Sized> StaticSchema for PhantomData<T> {
@@ -264,7 +312,10 @@ impl<T: ?Sized> StaticSchema for PhantomData<T> {
             name: "PhantomData".to_owned(),
         }
     }
-    const COLUMNS: usize = 0;
+    #[inline]
+    fn columns() -> usize {
+        0
+    }
 }
 
 impl StaticSchema for std::time::Duration {
@@ -277,7 +328,10 @@ impl StaticSchema for std::time::Duration {
             ],
         }
     }
-    const COLUMNS: usize = 2;
+    #[inline]
+    fn columns() -> usize {
+        2
+    }
 }
 
 impl StaticSchema for std::time::SystemTime {
@@ -296,7 +350,10 @@ impl StaticSchema for std::time::SystemTime {
             ],
         }
     }
-    const COLUMNS: usize = 2;
+    #[inline]
+    fn columns() -> usize {
+        2
+    }
 }
 
 #[cfg(test)]
@@ -304,14 +361,14 @@ mod tests {
     use super::*;
     use crate::layout::Layout;
 
-    /// Every `StaticSchema::COLUMNS` must equal what the layout builder
+    /// Every `StaticSchema::columns()` must equal what the layout builder
     /// derives from the same type's schema tree — the invariant the columnar
-    /// fast paths rely on for their compile-time column offsets.
+    /// fast paths rely on for their column offsets.
     fn assert_columns_agree<T: StaticSchema + ?Sized>() {
         assert_eq!(
-            T::COLUMNS,
+            T::columns(),
             Layout::new(&T::schema_node()).columns,
-            "COLUMNS disagrees with the layout for {}",
+            "columns() disagrees with the layout for {}",
             std::any::type_name::<T>(),
         );
     }

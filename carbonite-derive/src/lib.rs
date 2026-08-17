@@ -11,13 +11,20 @@
 //! cannot represent (`flatten`, `untagged`, `tag`/`content`, `with`,
 //! `from`/`into`, `skip_serializing_if`, and asymmetric skips).
 //!
-//! `#[carbonite(crate = "...")]` points the generated code at a renamed
-//! carbonite dependency.
+//! Two carbonite attributes of its own:
+//!
+//! - `#[carbonite(crate = "...")]` on the container points the generated code
+//!   at a renamed carbonite dependency.
+//! - `#[carbonite(serde)]` on a field opts that field out of the compile-time
+//!   machinery: its schema comes from a runtime trace and its data goes
+//!   through the serde path, which is what makes foreign types that only ship
+//!   serde impls usable in a derived struct. See `carbonite::fallback`.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, quote_spanned};
 use syn::meta::ParseNestedMeta;
+use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Fields, Index, LitStr, Member, Path, parse_macro_input, parse_quote};
 
 /// Derives `carbonite::StaticSchema` (a compile-time schema matching what
@@ -56,25 +63,43 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         }
     };
 
-    // Every type parameter needs a schema of its own.
+    // Every type parameter needs a schema of its own, unless it is only ever
+    // reached through a `#[carbonite(serde)]` field.
+    let roles = ParamRoles::collect(input)?;
     let mut generics = input.generics.clone();
-    for param in generics.type_params_mut() {
-        param.bounds.push(parse_quote!(#krate::StaticSchema));
-    }
+    roles.apply(&mut generics, &parse_quote!(#krate::StaticSchema), &krate);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let ident = &input.ident;
-    let columns = &parts.columns;
 
-    let columnar = columnar_impls(input, &parts, &krate);
+    // A fallback field's width comes from a runtime trace, so the sum is no
+    // longer a constant expression. Memoize it when the type is not generic
+    // (statics cannot be per-instantiation), since callers ask per row.
+    let columns = &parts.columns;
+    let columns_body = if parts.has_fallback && input.generics.params.is_empty() {
+        quote! {
+            static __COLUMNS: ::std::sync::OnceLock<usize> = ::std::sync::OnceLock::new();
+            *__COLUMNS.get_or_init(|| #columns)
+        }
+    } else {
+        quote!(#columns)
+    };
+
+    let columnar = columnar_impls(input, &parts, &roles, &krate);
+    let assertions = fallback_assertions(input, &krate)?;
 
     Ok(quote! {
+        #assertions
+
         #[automatically_derived]
         impl #impl_generics #krate::StaticSchema for #ident #ty_generics #where_clause {
             fn schema_node() -> #krate::SchemaNode {
                 #body
             }
 
-            const COLUMNS: usize = #columns;
+            #[inline]
+            fn columns() -> usize {
+                #columns_body
+            }
         }
 
         #columnar
@@ -114,32 +139,42 @@ fn parse_crate_path(attrs: &[syn::Attribute]) -> syn::Result<Path> {
 // ---------------------------------------------------------------------------
 
 struct ColumnarParts {
-    /// The type's total column count, for `StaticSchema::COLUMNS`.
+    /// The type's total column count, for `StaticSchema::columns`.
     columns: TokenStream2,
+    /// Whether any field is `#[carbonite(serde)]`, so `columns` is a runtime
+    /// value rather than a folded constant.
+    has_fallback: bool,
     ser_body: TokenStream2,
     de_body: TokenStream2,
 }
 
-fn columnar_impls(input: &DeriveInput, parts: &ColumnarParts, krate: &Path) -> TokenStream2 {
+fn columnar_impls(
+    input: &DeriveInput,
+    parts: &ColumnarParts,
+    roles: &ParamRoles,
+    krate: &Path,
+) -> TokenStream2 {
     let ColumnarParts {
         ser_body, de_body, ..
     } = parts;
     let ident = &input.ident;
 
     let mut ser_generics = input.generics.clone();
-    for param in ser_generics.type_params_mut() {
-        param.bounds.push(parse_quote!(#krate::SerializeColumns));
-    }
+    roles.apply(
+        &mut ser_generics,
+        &parse_quote!(#krate::SerializeColumns),
+        krate,
+    );
     let (ser_impl_generics, ty_generics, ser_where) = ser_generics.split_for_impl();
 
     // The deserialize impl is generic over the input lifetime 'de, which must
     // outlive every lifetime the type borrows (mirroring serde's derive).
     let mut de_generics = input.generics.clone();
-    for param in de_generics.type_params_mut() {
-        param
-            .bounds
-            .push(parse_quote!(#krate::DeserializeColumns<'de>));
-    }
+    roles.apply(
+        &mut de_generics,
+        &parse_quote!(#krate::DeserializeColumns<'de>),
+        krate,
+    );
     {
         let where_clause = de_generics.make_where_clause();
         for lifetime_def in input.generics.lifetimes() {
@@ -178,6 +213,8 @@ struct FieldModel<'a> {
     member: Member,
     ty: &'a syn::Type,
     skip: bool,
+    /// `#[carbonite(serde)]`; see [`field_node`].
+    fallback: bool,
 }
 
 fn field_models(fields: &Fields) -> syn::Result<Vec<FieldModel<'_>>> {
@@ -189,7 +226,7 @@ fn field_models(fields: &Fields) -> syn::Result<Vec<FieldModel<'_>>> {
     list.into_iter()
         .enumerate()
         .map(|(index, field)| {
-            let skip = parse_field_attrs(&field.attrs)?.skip;
+            let attrs = parse_field_attrs(&field.attrs)?;
             let member = match &field.ident {
                 Some(ident) => Member::Named(ident.clone()),
                 None => Member::Unnamed(Index::from(index)),
@@ -197,33 +234,191 @@ fn field_models(fields: &Fields) -> syn::Result<Vec<FieldModel<'_>>> {
             Ok(FieldModel {
                 member,
                 ty: &field.ty,
-                skip,
+                skip: attrs.skip,
+                fallback: attrs.fallback,
             })
         })
         .collect()
 }
 
-/// `(0usize + <T0>::COLUMNS + <T1>::COLUMNS + ...)` over the given types.
-fn columns_expr(tys: &[&syn::Type], krate: &Path) -> TokenStream2 {
-    quote!((0usize #(+ <#tys as #krate::StaticSchema>::COLUMNS)*))
+/// One field's schema node. A `#[carbonite(serde)]` field has no compile-time
+/// schema, so its node comes from a memoized runtime trace of the field type —
+/// which is exactly what tracing the containing type would have produced for
+/// it, keeping the derived schema identical to the traced one.
+fn field_node(ty: &syn::Type, fallback: bool, krate: &Path) -> TokenStream2 {
+    if fallback {
+        quote!(#krate::fallback::node::<#ty>())
+    } else {
+        quote!(<#ty as #krate::StaticSchema>::schema_node())
+    }
 }
 
-/// `<T>::COLUMNS` for one type.
-fn type_columns(ty: &syn::Type, krate: &Path) -> TokenStream2 {
-    quote!(<#ty as #krate::StaticSchema>::COLUMNS)
+/// One field's column count.
+fn field_columns(ty: &syn::Type, fallback: bool, krate: &Path) -> TokenStream2 {
+    if fallback {
+        quote!(#krate::fallback::columns::<#ty>())
+    } else {
+        quote!(<#ty as #krate::StaticSchema>::columns())
+    }
+}
+
+/// `(0usize + <T0>::columns() + <T1>::columns() + ...)` over the given
+/// `(type, fallback)` pairs.
+fn columns_expr(fields: &[(&syn::Type, bool)], krate: &Path) -> TokenStream2 {
+    let widths = fields
+        .iter()
+        .map(|(ty, fallback)| field_columns(ty, *fallback, krate));
+    quote!((0usize #(+ #widths)*))
+}
+
+/// How the fields use each generic parameter, which decides the bounds the
+/// generated impls place on it.
+struct ParamRoles {
+    /// Parameters reached through a `#[carbonite(serde)]` field, which travel
+    /// through serde rather than the columnar traits.
+    fallback: Vec<syn::Ident>,
+    /// Parameters reached *only* that way, which therefore need no schema of
+    /// their own.
+    fallback_only: Vec<syn::Ident>,
+}
+
+impl ParamRoles {
+    fn collect(input: &DeriveInput) -> syn::Result<Self> {
+        let uses = field_uses(&input.data)?;
+        let mut fallback = Vec::new();
+        let mut fallback_only = Vec::new();
+        for param in input.generics.type_params() {
+            let mentioned = |want_fallback: bool| {
+                uses.iter().any(|(ty, is_fallback)| {
+                    *is_fallback == want_fallback && mentions(ty, &param.ident)
+                })
+            };
+            if mentioned(true) {
+                fallback.push(param.ident.clone());
+                if !mentioned(false) {
+                    fallback_only.push(param.ident.clone());
+                }
+            }
+        }
+        Ok(ParamRoles {
+            fallback,
+            fallback_only,
+        })
+    }
+
+    /// Bounds every type parameter for one generated impl: `primary` is that
+    /// impl's own trait (`StaticSchema`, `SerializeColumns`,
+    /// `DeserializeColumns<'de>`), which fallback-only parameters skip.
+    fn apply(&self, generics: &mut syn::Generics, primary: &Path, krate: &Path) {
+        for param in generics.type_params_mut() {
+            if self.fallback.contains(&param.ident) {
+                param.bounds.push(parse_quote!(#krate::fallback::SerdeField));
+            }
+            if !self.fallback_only.contains(&param.ident) {
+                param.bounds.push(parse_quote!(#primary));
+            }
+        }
+    }
+}
+
+/// Restates what a `#[carbonite(serde)]` field type must provide, so a type
+/// that fails the requirement is reported against a trait that says so rather
+/// than through whatever the helper calls happen to surface first (a borrowing
+/// type otherwise lands on "implementation of `Deserialize` is not general
+/// enough").
+///
+/// Skipped for field types mentioning a type parameter, whose own impl bound
+/// already carries the same message. A field type that *borrows* is exactly the
+/// case worth naming, so the assertions sit in a function carrying the type's
+/// lifetimes.
+fn fallback_assertions(input: &DeriveInput, krate: &Path) -> syn::Result<TokenStream2> {
+    let params: Vec<&syn::Ident> = input.generics.type_params().map(|p| &p.ident).collect();
+    let checks: Vec<TokenStream2> = field_uses(&input.data)?
+        .iter()
+        .filter(|(ty, fallback)| *fallback && !params.iter().any(|param| mentions(ty, param)))
+        .map(|(ty, _)| quote_spanned!(ty.span() => __assert_serde_field::<#ty>();))
+        .collect();
+    if checks.is_empty() {
+        return Ok(TokenStream2::new());
+    }
+
+    // Only the lifetimes: the checks never mention a type parameter, and
+    // carrying unused ones would draw lints in the caller's crate.
+    let lifetimes: Vec<&syn::LifetimeParam> = input.generics.lifetimes().collect();
+    let generics = (!lifetimes.is_empty()).then(|| quote!(<#(#lifetimes),*>));
+    Ok(quote! {
+        const _: () = {
+            fn __assert_serde_field<T: #krate::fallback::SerdeField>() {}
+            #[allow(dead_code)]
+            fn __assert_carbonite_serde_fields #generics () {
+                #(#checks)*
+            }
+        };
+    })
+}
+
+/// The `(type, fallback)` pairs of every field that reaches the wire, across a
+/// struct's fields or all of an enum's live variants.
+fn field_uses(data: &Data) -> syn::Result<Vec<(&syn::Type, bool)>> {
+    let mut out = Vec::new();
+    match data {
+        Data::Struct(data) => collect_uses(&data.fields, &mut out)?,
+        Data::Enum(data) => {
+            for variant in &data.variants {
+                if parse_variant_attrs(&variant.attrs)?.skip {
+                    continue;
+                }
+                collect_uses(&variant.fields, &mut out)?;
+            }
+        }
+        Data::Union(_) => {}
+    }
+    Ok(out)
+}
+
+fn collect_uses<'a>(fields: &'a Fields, out: &mut Vec<(&'a syn::Type, bool)>) -> syn::Result<()> {
+    for model in field_models(fields)? {
+        if !model.skip {
+            out.push((model.ty, model.fallback));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `ty` mentions the identifier `param` anywhere.
+fn mentions(ty: &syn::Type, param: &syn::Ident) -> bool {
+    fn scan(tokens: TokenStream2, needle: &syn::Ident) -> bool {
+        tokens.into_iter().any(|token| match token {
+            proc_macro2::TokenTree::Ident(ident) => ident == *needle,
+            proc_macro2::TokenTree::Group(group) => scan(group.stream(), needle),
+            _ => false,
+        })
+    }
+    scan(quote!(#ty), param)
 }
 
 fn columnar_struct_parts(fields: &Fields, krate: &Path) -> syn::Result<ColumnarParts> {
     let models = field_models(fields)?;
-    let active_tys: Vec<&syn::Type> = models.iter().filter(|m| !m.skip).map(|m| m.ty).collect();
-    let columns = columns_expr(&active_tys, krate);
+    let active: Vec<(&syn::Type, bool)> = models
+        .iter()
+        .filter(|m| !m.skip)
+        .map(|m| (m.ty, m.fallback))
+        .collect();
+    let columns = columns_expr(&active, krate);
+    let has_fallback = active.iter().any(|(_, fallback)| *fallback);
 
     let ser_steps: Vec<TokenStream2> = models
         .iter()
         .filter(|m| !m.skip)
         .map(|m| {
             let member = &m.member;
-            let width = type_columns(m.ty, krate);
+            let ty = m.ty;
+            if m.fallback {
+                return quote! {
+                    #krate::fallback::serialize::<#ty>(&self.#member, &mut __rest)?;
+                };
+            }
+            let width = field_columns(ty, false, krate);
             quote! {
                 #krate::SerializeColumns::serialize_columns(
                     &self.#member,
@@ -247,12 +442,18 @@ fn columnar_struct_parts(fields: &Fields, krate: &Path) -> syn::Result<ColumnarP
         } else {
             let tmp = format_ident!("__field{index}");
             let ty = m.ty;
-            let width = type_columns(ty, krate);
-            reads.push(quote! {
-                let #tmp = <#ty as #krate::DeserializeColumns<'de>>::deserialize_columns(
-                    #krate::columnar::__split(&mut __rest, #width),
-                )?;
-            });
+            if m.fallback {
+                reads.push(quote! {
+                    let #tmp = #krate::fallback::deserialize::<#ty>(&mut __rest)?;
+                });
+            } else {
+                let width = field_columns(ty, false, krate);
+                reads.push(quote! {
+                    let #tmp = <#ty as #krate::DeserializeColumns<'de>>::deserialize_columns(
+                        #krate::columnar::__split(&mut __rest, #width),
+                    )?;
+                });
+            }
             values.push(quote!(#tmp));
         }
     }
@@ -265,6 +466,7 @@ fn columnar_struct_parts(fields: &Fields, krate: &Path) -> syn::Result<ColumnarP
 
     Ok(ColumnarParts {
         columns,
+        has_fallback,
         ser_body,
         de_body,
     })
@@ -293,12 +495,20 @@ fn columnar_enum_parts(data: &syn::DataEnum, krate: &Path) -> syn::Result<Column
     }
 
     // Per-variant column-count expressions, and each variant's offset past
-    // the tag column and all preceding variants' columns. All const.
+    // the tag column and all preceding variants' columns. Constant unless a
+    // variant carries a `#[carbonite(serde)]` field.
+    let has_fallback = active
+        .iter()
+        .any(|(_, models)| models.iter().any(|m| !m.skip && m.fallback));
     let counts: Vec<TokenStream2> = active
         .iter()
         .map(|(_, models)| {
-            let tys: Vec<&syn::Type> = models.iter().filter(|m| !m.skip).map(|m| m.ty).collect();
-            columns_expr(&tys, krate)
+            let fields: Vec<(&syn::Type, bool)> = models
+                .iter()
+                .filter(|m| !m.skip)
+                .map(|m| (m.ty, m.fallback))
+                .collect();
+            columns_expr(&fields, krate)
         })
         .collect();
     let offsets: Vec<TokenStream2> = (0..active.len())
@@ -314,8 +524,13 @@ fn columnar_enum_parts(data: &syn::DataEnum, krate: &Path) -> syn::Result<Column
         let tag = k as u64;
         let offset = &offsets[k];
         let (pattern, bindings) = variant_pattern(&variant.ident, &variant.fields, models);
-        let steps = bindings.iter().map(|(binding, ty)| {
-            let width = type_columns(ty, krate);
+        let steps = bindings.iter().map(|(binding, ty, fallback)| {
+            if *fallback {
+                return quote! {
+                    #krate::fallback::serialize::<#ty>(#binding, &mut __rest)?;
+                };
+            }
+            let width = field_columns(ty, false, krate);
             quote! {
                 #krate::SerializeColumns::serialize_columns(
                     #binding,
@@ -359,12 +574,18 @@ fn columnar_enum_parts(data: &syn::DataEnum, krate: &Path) -> syn::Result<Column
             } else {
                 let tmp = format_ident!("__field{index}");
                 let ty = m.ty;
-                let width = type_columns(ty, krate);
-                reads.push(quote! {
-                    let #tmp = <#ty as #krate::DeserializeColumns<'de>>::deserialize_columns(
-                        #krate::columnar::__split(&mut __rest, #width),
-                    )?;
-                });
+                if m.fallback {
+                    reads.push(quote! {
+                        let #tmp = #krate::fallback::deserialize::<#ty>(&mut __rest)?;
+                    });
+                } else {
+                    let width = field_columns(ty, false, krate);
+                    reads.push(quote! {
+                        let #tmp = <#ty as #krate::DeserializeColumns<'de>>::deserialize_columns(
+                            #krate::columnar::__split(&mut __rest, #width),
+                        )?;
+                    });
+                }
                 values.push(quote!(#tmp));
             }
         }
@@ -396,18 +617,19 @@ fn columnar_enum_parts(data: &syn::DataEnum, krate: &Path) -> syn::Result<Column
 
     Ok(ColumnarParts {
         columns,
+        has_fallback,
         ser_body,
         de_body,
     })
 }
 
 /// Builds a match pattern binding every non-skipped field, returning the
-/// pattern and the `(binding, type)` pairs in field order.
+/// pattern and the `(binding, type, fallback)` triples in field order.
 fn variant_pattern<'a>(
     vident: &syn::Ident,
     fields: &Fields,
     models: &'a [FieldModel<'a>],
-) -> (TokenStream2, Vec<(syn::Ident, &'a syn::Type)>) {
+) -> (TokenStream2, Vec<(syn::Ident, &'a syn::Type, bool)>) {
     match fields {
         Fields::Unit => (quote!(Self::#vident), Vec::new()),
         Fields::Unnamed(_) => {
@@ -419,7 +641,7 @@ fn variant_pattern<'a>(
                 } else {
                     let binding = format_ident!("__binding{index}");
                     pats.push(quote!(#binding));
-                    bindings.push((binding, m.ty));
+                    bindings.push((binding, m.ty, m.fallback));
                 }
             }
             (quote!(Self::#vident(#(#pats),*)), bindings)
@@ -434,7 +656,7 @@ fn variant_pattern<'a>(
                 } else {
                     let binding = format_ident!("__binding{index}");
                     pats.push(quote!(#member: #binding));
-                    bindings.push((binding, m.ty));
+                    bindings.push((binding, m.ty, m.fallback));
                 }
             }
             (quote!(Self::#vident { #(#pats),* }), bindings)
@@ -454,31 +676,33 @@ fn expand_struct(
     krate: &Path,
 ) -> syn::Result<TokenStream2> {
     if container.transparent {
-        let mut tys = Vec::new();
+        let mut inner = Vec::new();
         match fields {
             Fields::Named(named) => {
                 for field in &named.named {
-                    if !parse_field_attrs(&field.attrs)?.skip {
-                        tys.push(&field.ty);
+                    let attrs = parse_field_attrs(&field.attrs)?;
+                    if !attrs.skip {
+                        inner.push((&field.ty, attrs.fallback));
                     }
                 }
             }
             Fields::Unnamed(unnamed) => {
                 for field in &unnamed.unnamed {
-                    if !parse_field_attrs(&field.attrs)?.skip {
-                        tys.push(&field.ty);
+                    let attrs = parse_field_attrs(&field.attrs)?;
+                    if !attrs.skip {
+                        inner.push((&field.ty, attrs.fallback));
                     }
                 }
             }
             Fields::Unit => {}
         }
-        let [ty] = tys.as_slice() else {
+        let [(ty, fallback)] = inner.as_slice() else {
             return Err(syn::Error::new_spanned(
                 &input.ident,
                 "serde(transparent) requires exactly one non-skipped field",
             ));
         };
-        return Ok(quote!(<#ty as #krate::StaticSchema>::schema_node()));
+        return Ok(field_node(ty, *fallback, krate));
     }
 
     match fields {
@@ -486,24 +710,24 @@ fn expand_struct(
             #krate::SchemaNode::UnitStruct { name: #name.to_owned() }
         }),
         Fields::Unnamed(unnamed) => {
-            let tys = unnamed_field_types(unnamed)?;
-            if unnamed.unnamed.len() == 1 && tys.len() == 1 {
-                let ty = tys[0];
+            let inner = unnamed_fields(unnamed)?;
+            if unnamed.unnamed.len() == 1 && inner.len() == 1 {
+                let (ty, fallback) = inner[0];
+                let node = field_node(ty, fallback, krate);
                 Ok(quote! {
                     #krate::SchemaNode::NewtypeStruct {
                         name: #name.to_owned(),
-                        inner: ::std::boxed::Box::new(
-                            <#ty as #krate::StaticSchema>::schema_node(),
-                        ),
+                        inner: ::std::boxed::Box::new(#node),
                     }
                 })
             } else {
+                let nodes = inner
+                    .iter()
+                    .map(|(ty, fallback)| field_node(ty, *fallback, krate));
                 Ok(quote! {
                     #krate::SchemaNode::TupleStruct {
                         name: #name.to_owned(),
-                        fields: ::std::vec![
-                            #(<#tys as #krate::StaticSchema>::schema_node()),*
-                        ],
+                        fields: ::std::vec![#(#nodes),*],
                     }
                 })
             }
@@ -545,19 +769,19 @@ fn expand_enum(
         let shape = match &variant.fields {
             Fields::Unit => quote!(#krate::VariantNode::Unit),
             Fields::Unnamed(unnamed) => {
-                let tys = unnamed_field_types(unnamed)?;
-                if unnamed.unnamed.len() == 1 && tys.len() == 1 {
-                    let ty = tys[0];
+                let inner = unnamed_fields(unnamed)?;
+                if unnamed.unnamed.len() == 1 && inner.len() == 1 {
+                    let (ty, fallback) = inner[0];
+                    let node = field_node(ty, fallback, krate);
                     quote! {
-                        #krate::VariantNode::Newtype(::std::boxed::Box::new(
-                            <#ty as #krate::StaticSchema>::schema_node(),
-                        ))
+                        #krate::VariantNode::Newtype(::std::boxed::Box::new(#node))
                     }
                 } else {
+                    let nodes = inner
+                        .iter()
+                        .map(|(ty, fallback)| field_node(ty, *fallback, krate));
                     quote! {
-                        #krate::VariantNode::Tuple(::std::vec![
-                            #(<#tys as #krate::StaticSchema>::schema_node()),*
-                        ])
+                        #krate::VariantNode::Tuple(::std::vec![#(#nodes),*])
                     }
                 }
             }
@@ -592,22 +816,24 @@ fn named_field_entries(
             Some(rule) => rule.apply_to_field(&ident),
             None => ident,
         });
-        let ty = &field.ty;
+        let node = field_node(&field.ty, attrs.fallback, krate);
         entries.push(quote! {
-            (#name.to_owned(), <#ty as #krate::StaticSchema>::schema_node())
+            (#name.to_owned(), #node)
         });
     }
     Ok(entries)
 }
 
-fn unnamed_field_types(fields: &syn::FieldsUnnamed) -> syn::Result<Vec<&syn::Type>> {
-    let mut tys = Vec::new();
+/// The `(type, fallback)` pairs of the non-skipped positional fields.
+fn unnamed_fields(fields: &syn::FieldsUnnamed) -> syn::Result<Vec<(&syn::Type, bool)>> {
+    let mut out = Vec::new();
     for field in &fields.unnamed {
-        if !parse_field_attrs(&field.attrs)?.skip {
-            tys.push(&field.ty);
+        let attrs = parse_field_attrs(&field.attrs)?;
+        if !attrs.skip {
+            out.push((&field.ty, attrs.fallback));
         }
     }
-    Ok(tys)
+    Ok(out)
 }
 
 fn strip_raw(ident: &str) -> String {
@@ -630,6 +856,9 @@ struct ContainerAttrs {
 struct FieldAttrs {
     rename: Option<String>,
     skip: bool,
+    /// `#[carbonite(serde)]`: take this field's schema from a runtime trace
+    /// and route its data through the serde path.
+    fallback: bool,
 }
 
 #[derive(Default)]
@@ -682,7 +911,23 @@ fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerAttrs
 
 fn parse_field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
     let mut out = FieldAttrs::default();
+    let mut fallback_attr = None;
     for attr in attrs {
+        if attr.path().is_ident("carbonite") {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("serde") {
+                    out.fallback = true;
+                    fallback_attr = Some(attr);
+                    Ok(())
+                } else {
+                    Err(meta.error(
+                        "unrecognized carbonite field attribute; the only one is `serde`, \
+                         which routes this field through the serde path",
+                    ))
+                }
+            })?;
+            continue;
+        }
         if !attr.path().is_ident("serde") {
             continue;
         }
@@ -720,6 +965,13 @@ fn parse_field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
             }
             Ok(())
         })?;
+    }
+    if let Some(attr) = fallback_attr.filter(|_| out.skip) {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "this field is `serde(skip)`, so it has no columns and nothing for \
+             carbonite(serde) to route",
+        ));
     }
     Ok(out)
 }

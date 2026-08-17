@@ -87,6 +87,42 @@ fn item_strategy() -> impl Strategy<Value = Item> {
         })
 }
 
+/// A type with serde impls and no carbonite derive, so it has no
+/// `StaticSchema` and can only reach a derived struct through
+/// `#[carbonite(serde)]`.
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+struct Payload {
+    tag: Option<u16>,
+    parts: Vec<String>,
+    table: BTreeMap<u8, i64>,
+}
+
+#[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug, Clone)]
+struct Envelope {
+    item: Item,
+    #[carbonite(serde)]
+    payload: Payload,
+    trailer: u32,
+}
+
+fn envelope_strategy() -> impl Strategy<Value = Envelope> {
+    (
+        item_strategy(),
+        (
+            proptest::option::of(any::<u16>()),
+            proptest::collection::vec(".{0,6}", 0..5),
+            proptest::collection::btree_map(any::<u8>(), any::<i64>(), 0..5),
+        )
+            .prop_map(|(tag, parts, table)| Payload { tag, parts, table }),
+        any::<u32>(),
+    )
+        .prop_map(|(item, payload, trailer)| Envelope {
+            item,
+            payload,
+            trailer,
+        })
+}
+
 proptest! {
     #[test]
     fn arbitrary_values_round_trip(items in proptest::collection::vec(item_strategy(), 0..10)) {
@@ -107,6 +143,35 @@ proptest! {
         let de = carbonite::Deserializer::new_static(schema);
         let back: Vec<Item> = de.from_slice_columns(&columnar_bytes).unwrap();
         prop_assert_eq!(back, items);
+    }
+
+    /// A `#[carbonite(serde)]` field must be indistinguishable from a traced
+    /// one: same schema, same bytes from either writer, and readable by a type
+    /// that never heard of the attribute.
+    #[test]
+    fn fallback_fields_are_indistinguishable(
+        values in proptest::collection::vec(envelope_strategy(), 0..8)
+    ) {
+        use carbonite::StaticSchema;
+
+        let schema = <Vec<Envelope>>::schema();
+        prop_assert_eq!(&schema, &carbonite::Schema::<Vec<Envelope>>::new().unwrap());
+
+        let ser = carbonite::Serializer::new(&schema);
+        let columnar_bytes = ser.to_vec_columns(&values).unwrap();
+        prop_assert_eq!(&columnar_bytes, &ser.to_vec(&values).unwrap());
+
+        let de = carbonite::Deserializer::new_static(schema);
+        let via_serde: Vec<Envelope> = de.from_slice(&columnar_bytes).unwrap();
+        let via_columns: Vec<Envelope> = de.from_slice_columns(&columnar_bytes).unwrap();
+        prop_assert_eq!(&via_serde, &values);
+        prop_assert_eq!(&via_columns, &values);
+
+        // A reader that skips the whole row must still walk the fallback
+        // field's columns exactly.
+        let framed = carbonite::to_vec_static(&values).unwrap();
+        let ignored: Vec<serde::de::IgnoredAny> = carbonite::from_slice(&framed).unwrap();
+        prop_assert_eq!(ignored.len(), values.len());
     }
 
     /// Nothing carbonite itself writes may be rejected by the length bounds

@@ -28,8 +28,9 @@ default = ["derive"]
 derive = ["dep:carbonite-derive"]
 
 [dependencies]
-# Pinned exactly: the derive emits calls to carbonite's `__`-prefixed internal
-# helpers, so the two must be upgraded together.
+# Pinned exactly: the derive emits calls to carbonite's internal helpers (the
+# `__`-prefixed items and the hidden `fallback` module), so the two must be
+# upgraded together.
 carbonite-derive = { version = "=1.0.0", path = "carbonite-derive", optional = true }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
