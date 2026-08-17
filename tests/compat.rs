@@ -511,3 +511,93 @@ fn a_schema_snapshot_round_trips_through_bytes() {
     let released = Schema::<SaveV1>::from_bytes(&snapshot).unwrap();
     compat::check(&released).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Nested enums. The sampler's pick is mixed-radix — each enum consumes the
+// low digit and hands the quotient to its payload — so an enum nested inside
+// a variant is exercised across all of *its* variants too. Regression: with
+// one shared pick, an inner enum whose count shared a factor with the outer's
+// only ever saw one residue class, and removed inner variants went unnoticed.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dropping_a_nested_enum_variant_is_caught() {
+    #[derive(Serialize, Deserialize)]
+    enum InnerV1 {
+        X,
+        Y,
+    }
+    #[derive(Serialize, Deserialize)]
+    enum OuterV1 {
+        A,
+        B(InnerV1),
+    }
+
+    #[derive(Deserialize)]
+    enum Inner {
+        Y,
+    }
+    #[derive(Deserialize)]
+    enum Outer {
+        A,
+        B(Inner),
+    }
+
+    let snapshot = Schema::<OuterV1>::new().unwrap().cast::<Outer>();
+
+    // Real old data using the removed inner variant no longer reads...
+    let old = carbonite::to_vec(&OuterV1::B(InnerV1::X)).unwrap();
+    assert!(carbonite::from_slice::<Outer>(&old).is_err());
+
+    // ...so the check must say so rather than passing.
+    let err = compat::check(&snapshot).unwrap_err();
+    assert!(matches!(err, Incompatible::Unreadable(_)), "{err}");
+}
+
+#[test]
+fn a_variant_three_levels_deep_is_still_exercised() {
+    // Distinct leaf types per position, so dropping a variant from the
+    // *deepest, least-sampled* one (U → N → P) is only caught if the sampler
+    // really reaches every leaf variant on every path.
+    #[derive(Serialize, Deserialize)]
+    enum Leaf1 {
+        P,
+        Q,
+    }
+    #[derive(Serialize, Deserialize)]
+    enum Leaf2 {
+        P,
+        Q,
+    }
+    #[derive(Serialize, Deserialize)]
+    enum MidV1 {
+        M(Leaf1),
+        N(Leaf2),
+    }
+    #[derive(Serialize, Deserialize)]
+    enum TopV1 {
+        T,
+        U(MidV1),
+    }
+
+    #[derive(Deserialize)]
+    enum Leaf2Small {
+        Q,
+    }
+    #[derive(Deserialize)]
+    enum MidSmall {
+        M(Leaf1),
+        N(Leaf2Small),
+    }
+    #[derive(Deserialize)]
+    enum TopSmall {
+        T,
+        U(MidSmall),
+    }
+
+    let err = compat::check(&Schema::<TopV1>::new().unwrap().cast::<TopSmall>()).unwrap_err();
+    assert!(matches!(err, Incompatible::Unreadable(_)), "{err}");
+
+    // The unchanged type still passes with the multiplied row count.
+    compat::check(&Schema::<TopV1>::new().unwrap()).unwrap();
+}

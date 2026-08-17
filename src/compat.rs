@@ -373,7 +373,7 @@ fn probe<T: DeserializeOwned>(writer: &SchemaNode) -> Result<(), Error> {
 /// every enum variant is written at least once.
 fn sample(writer: &SchemaNode) -> Vec<u8> {
     let layout = Layout::new(writer);
-    let rows = variant_span(writer);
+    let rows = variant_span(writer).min(MAX_PROBE_ROWS);
     let mut columns = vec![Vec::new(); layout.columns];
     for pick in 0..rows {
         write_row(writer, &layout.root, &mut columns, pick);
@@ -457,9 +457,20 @@ fn write_row(node: &SchemaNode, lnode: &LNode, columns: &mut [Vec<u8>], pick: us
                 variants: lvariants,
             },
         ) => {
+            // Mixed-radix: this enum consumes the low digit of `pick` and
+            // hands the quotient to its payload, so an enum *nested inside a
+            // variant* still sees every value of its own digit. Reusing the
+            // whole pick below would show the inner enum only picks congruent
+            // to this variant's index, skipping inner variants whenever the
+            // two counts share a factor.
             let index = pick % variants.len();
             varint::write(&mut columns[*tag], index as u64);
-            write_variant(&variants[index].1, &lvariants[index], columns, pick);
+            write_variant(
+                &variants[index].1,
+                &lvariants[index],
+                columns,
+                pick / variants.len(),
+            );
         }
         (SchemaNode::Shared(inner), LNode::Shared { key, inner: linner }) => {
             // Key 0 is a first occurrence, so the payload follows it.
@@ -507,6 +518,13 @@ fn write_primitive(p: Primitive, out: &mut Vec<u8>) {
 
 /// How many rows it takes for every enum in the schema to write each of its
 /// variants at least once.
+///
+/// Siblings share each row's pick, so they need the *maximum* of their spans;
+/// an enum nested inside a variant sees only the quotient after its parent
+/// consumes the low digit (see `write_row`), so nesting *multiplies*. The
+/// product grows with enum nesting depth — a chain of enums-inside-variants
+/// needs the product of their variant counts — which is small for any real
+/// type; [`MAX_PROBE_ROWS`] bounds the pathological case.
 fn variant_span(node: &SchemaNode) -> usize {
     match node {
         SchemaNode::Option(inner)
@@ -529,11 +547,18 @@ fn variant_span(node: &SchemaNode) -> usize {
                 })
                 .max()
                 .unwrap_or(1);
-            variants.len().max(nested)
+            variants.len().saturating_mul(nested)
         }
         _ => 1,
     }
 }
+
+/// Cap on the probe blob's row count. Only reachable by a schema whose
+/// enum-nesting chain multiplies past a million combinations — at which point
+/// no row-per-combination probe is tractable, and the check's coverage
+/// (already "each variant at least once", not "every combination") degrades
+/// to the rows that fit.
+const MAX_PROBE_ROWS: usize = 1 << 20;
 
 fn span_of<'a>(fields: impl Iterator<Item = &'a SchemaNode>) -> usize {
     fields.map(variant_span).max().unwrap_or(1)

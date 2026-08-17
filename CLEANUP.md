@@ -6,7 +6,14 @@ suggested fix so it can be picked up cold.
 
 ## 1. `compat` gives a false green for removed nested-enum variants
 
-**Bug, confirmed by test.** The sampler in `src/compat.rs` (`sample` /
+**Status: fixed.** `write_row` now consumes the low digit of `pick` at each
+enum and hands the quotient to the payload (mixed-radix), and `variant_span`
+multiplies through nesting instead of taking the max, capped at
+`MAX_PROBE_ROWS` for pathological chains. Regression tests:
+`dropping_a_nested_enum_variant_is_caught` and
+`a_variant_three_levels_deep_is_still_exercised` in `tests/compat.rs`.
+
+**Original finding, confirmed by test.** The sampler in `src/compat.rs` (`sample` /
 `write_row` / `variant_span`) writes `variant_span` rows and uses the *same*
 `pick` for every enum along a path: the outer tag is `pick % outer_len`, so a
 nested enum inside outer variant `i` only ever sees picks `≡ i (mod
