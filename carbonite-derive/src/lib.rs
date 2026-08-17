@@ -10,9 +10,9 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::meta::ParseNestedMeta;
-use syn::{Data, DeriveInput, Fields, LitStr, parse_macro_input, parse_quote};
+use syn::{Data, DeriveInput, Fields, Index, LitStr, Member, parse_macro_input, parse_quote};
 
 /// Derives `carbonite::StaticSchema`: a compile-time schema matching what
 /// runtime tracing would produce.
@@ -50,6 +50,8 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let ident = &input.ident;
 
+    let columnar = columnar_impls(input)?;
+
     Ok(quote! {
         #[automatically_derived]
         impl #impl_generics ::carbonite::StaticSchema for #ident #ty_generics #where_clause {
@@ -57,7 +59,389 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 #body
             }
         }
+
+        #columnar
     })
+}
+
+// ---------------------------------------------------------------------------
+// Columnar fast-path impls (SerializeColumns / DeserializeColumns).
+//
+// These generate straight-line readers/writers whose column offsets are
+// compile-time constants. They must write byte-for-byte what carbonite's
+// serde-driven path writes, over the column layout of the generated
+// StaticSchema: columns depth-first, a node's own columns before its
+// children's.
+// ---------------------------------------------------------------------------
+
+struct ColumnarParts {
+    ser_columns: TokenStream2,
+    ser_body: TokenStream2,
+    de_columns: TokenStream2,
+    de_body: TokenStream2,
+}
+
+fn columnar_impls(input: &DeriveInput) -> syn::Result<TokenStream2> {
+    let parts = match &input.data {
+        Data::Struct(data) => columnar_struct_parts(&data.fields)?,
+        Data::Enum(data) => columnar_enum_parts(data)?,
+        Data::Union(u) => {
+            return Err(syn::Error::new_spanned(
+                u.union_token,
+                "carbonite cannot derive Schema for unions",
+            ));
+        }
+    };
+    let ColumnarParts {
+        ser_columns,
+        ser_body,
+        de_columns,
+        de_body,
+    } = parts;
+    let ident = &input.ident;
+
+    let mut ser_generics = input.generics.clone();
+    for param in ser_generics.type_params_mut() {
+        param
+            .bounds
+            .push(parse_quote!(::carbonite::SerializeColumns));
+    }
+    let (ser_impl_generics, ty_generics, ser_where) = ser_generics.split_for_impl();
+
+    // The deserialize impl is generic over the input lifetime 'de, which must
+    // outlive every lifetime the type borrows (mirroring serde's derive).
+    let mut de_generics = input.generics.clone();
+    for param in de_generics.type_params_mut() {
+        param
+            .bounds
+            .push(parse_quote!(::carbonite::DeserializeColumns<'de>));
+    }
+    {
+        let where_clause = de_generics.make_where_clause();
+        for lifetime_def in input.generics.lifetimes() {
+            let lifetime = &lifetime_def.lifetime;
+            where_clause.predicates.push(parse_quote!('de: #lifetime));
+        }
+    }
+    de_generics.params.insert(0, parse_quote!('de));
+    let (de_impl_generics, _, de_where) = de_generics.split_for_impl();
+
+    Ok(quote! {
+        #[automatically_derived]
+        impl #ser_impl_generics ::carbonite::SerializeColumns for #ident #ty_generics #ser_where {
+            const COLUMNS: usize = #ser_columns;
+
+            #[allow(unused_variables, unused_mut)]
+            fn serialize_columns(
+                &self,
+                columns: &mut [::std::vec::Vec<u8>],
+            ) -> ::carbonite::Result<()> {
+                #ser_body
+            }
+        }
+
+        #[automatically_derived]
+        impl #de_impl_generics ::carbonite::DeserializeColumns<'de> for #ident #ty_generics #de_where {
+            const COLUMNS: usize = #de_columns;
+
+            #[allow(unused_variables, unused_mut)]
+            fn deserialize_columns(
+                cursors: &mut [::carbonite::columnar::ColumnCursor<'de>],
+            ) -> ::carbonite::Result<Self> {
+                #de_body
+            }
+        }
+    })
+}
+
+struct FieldModel<'a> {
+    member: Member,
+    ty: &'a syn::Type,
+    skip: bool,
+}
+
+fn field_models(fields: &Fields) -> syn::Result<Vec<FieldModel<'_>>> {
+    let list: Vec<&syn::Field> = match fields {
+        Fields::Unit => Vec::new(),
+        Fields::Named(named) => named.named.iter().collect(),
+        Fields::Unnamed(unnamed) => unnamed.unnamed.iter().collect(),
+    };
+    list.into_iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let skip = parse_field_attrs(&field.attrs)?.skip;
+            let member = match &field.ident {
+                Some(ident) => Member::Named(ident.clone()),
+                None => Member::Unnamed(Index::from(index)),
+            };
+            Ok(FieldModel {
+                member,
+                ty: &field.ty,
+                skip,
+            })
+        })
+        .collect()
+}
+
+fn ser_trait() -> TokenStream2 {
+    quote!(::carbonite::SerializeColumns)
+}
+
+fn de_trait() -> TokenStream2 {
+    quote!(::carbonite::DeserializeColumns<'de>)
+}
+
+/// `(0usize + <T0>::COLUMNS + <T1>::COLUMNS + ...)` over the given types.
+fn columns_expr(tys: &[&syn::Type], trait_path: &TokenStream2) -> TokenStream2 {
+    quote!((0usize #(+ <#tys as #trait_path>::COLUMNS)*))
+}
+
+fn columnar_struct_parts(fields: &Fields) -> syn::Result<ColumnarParts> {
+    let models = field_models(fields)?;
+    let active_tys: Vec<&syn::Type> = models.iter().filter(|m| !m.skip).map(|m| m.ty).collect();
+    let ser_columns = columns_expr(&active_tys, &ser_trait());
+    let de_columns = columns_expr(&active_tys, &de_trait());
+
+    let ser_steps: Vec<TokenStream2> = models
+        .iter()
+        .filter(|m| !m.skip)
+        .map(|m| {
+            let member = &m.member;
+            let ty = m.ty;
+            quote! {
+                ::carbonite::SerializeColumns::serialize_columns(
+                    &self.#member,
+                    ::carbonite::columnar::__split(
+                        &mut __rest,
+                        <#ty as ::carbonite::SerializeColumns>::COLUMNS,
+                    ),
+                )?;
+            }
+        })
+        .collect();
+    let ser_body = quote! {
+        let mut __rest = columns;
+        #(#ser_steps)*
+        ::core::result::Result::Ok(())
+    };
+
+    let mut reads = Vec::new();
+    let mut values = Vec::new();
+    for (index, m) in models.iter().enumerate() {
+        if m.skip {
+            // serde fills skipped fields from Default on deserialize.
+            values.push(quote!(::core::default::Default::default()));
+        } else {
+            let tmp = format_ident!("__field{index}");
+            let ty = m.ty;
+            reads.push(quote! {
+                let #tmp = <#ty as ::carbonite::DeserializeColumns<'de>>::deserialize_columns(
+                    ::carbonite::columnar::__split(
+                        &mut __rest,
+                        <#ty as ::carbonite::DeserializeColumns<'de>>::COLUMNS,
+                    ),
+                )?;
+            });
+            values.push(quote!(#tmp));
+        }
+    }
+    let ctor = constructor(fields, &models, &values);
+    let de_body = quote! {
+        let mut __rest = cursors;
+        #(#reads)*
+        ::core::result::Result::Ok(#ctor)
+    };
+
+    Ok(ColumnarParts {
+        ser_columns,
+        ser_body,
+        de_columns,
+        de_body,
+    })
+}
+
+fn constructor(fields: &Fields, models: &[FieldModel], values: &[TokenStream2]) -> TokenStream2 {
+    match fields {
+        Fields::Unit => quote!(Self),
+        Fields::Unnamed(_) => quote!(Self(#(#values),*)),
+        Fields::Named(_) => {
+            let members = models.iter().map(|m| &m.member);
+            quote!(Self { #(#members: #values),* })
+        }
+    }
+}
+
+fn columnar_enum_parts(data: &syn::DataEnum) -> syn::Result<ColumnarParts> {
+    let mut active = Vec::new();
+    let mut skipped = Vec::new();
+    for variant in &data.variants {
+        if parse_variant_attrs(&variant.attrs)?.skip {
+            skipped.push(&variant.ident);
+        } else {
+            active.push((variant, field_models(&variant.fields)?));
+        }
+    }
+
+    // Per-variant column-count expressions, and each variant's offset past
+    // the tag column and all preceding variants' columns. All const.
+    let per_variant = |trait_path: &TokenStream2| -> (Vec<TokenStream2>, Vec<TokenStream2>) {
+        let counts: Vec<TokenStream2> = active
+            .iter()
+            .map(|(_, models)| {
+                let tys: Vec<&syn::Type> =
+                    models.iter().filter(|m| !m.skip).map(|m| m.ty).collect();
+                columns_expr(&tys, trait_path)
+            })
+            .collect();
+        let offsets = (0..active.len())
+            .map(|k| {
+                let preceding = &counts[..k];
+                quote!((1usize #(+ #preceding)*))
+            })
+            .collect();
+        (counts, offsets)
+    };
+    let (ser_counts, ser_offsets) = per_variant(&ser_trait());
+    let (de_counts, de_offsets) = per_variant(&de_trait());
+    let ser_columns = quote!((1usize #(+ #ser_counts)*));
+    let de_columns = quote!((1usize #(+ #de_counts)*));
+
+    let mut ser_arms = Vec::new();
+    for (k, (variant, models)) in active.iter().enumerate() {
+        let tag = k as u64;
+        let offset = &ser_offsets[k];
+        let (pattern, bindings) = variant_pattern(&variant.ident, &variant.fields, models);
+        let steps = bindings.iter().map(|(binding, ty)| {
+            quote! {
+                ::carbonite::SerializeColumns::serialize_columns(
+                    #binding,
+                    ::carbonite::columnar::__split(
+                        &mut __rest,
+                        <#ty as ::carbonite::SerializeColumns>::COLUMNS,
+                    ),
+                )?;
+            }
+        });
+        ser_arms.push(quote! {
+            #pattern => {
+                ::carbonite::columnar::write_varint(&mut columns[0usize], #tag);
+                let mut __rest = &mut columns[#offset..];
+                #(#steps)*
+                ::core::result::Result::Ok(())
+            }
+        });
+    }
+    for ident in &skipped {
+        let name = strip_raw(&ident.to_string());
+        ser_arms.push(quote! {
+            Self::#ident { .. } => ::core::result::Result::Err(
+                ::carbonite::columnar::__skipped_variant(#name),
+            )
+        });
+    }
+    let ser_body = if data.variants.is_empty() {
+        quote!(match *self {})
+    } else {
+        quote!(match self { #(#ser_arms,)* })
+    };
+
+    let mut de_arms = Vec::new();
+    for (k, (variant, models)) in active.iter().enumerate() {
+        let tag = k as u64;
+        let offset = &de_offsets[k];
+        let vident = &variant.ident;
+        let mut reads = Vec::new();
+        let mut values = Vec::new();
+        for (index, m) in models.iter().enumerate() {
+            if m.skip {
+                values.push(quote!(::core::default::Default::default()));
+            } else {
+                let tmp = format_ident!("__field{index}");
+                let ty = m.ty;
+                reads.push(quote! {
+                    let #tmp = <#ty as ::carbonite::DeserializeColumns<'de>>::deserialize_columns(
+                        ::carbonite::columnar::__split(
+                            &mut __rest,
+                            <#ty as ::carbonite::DeserializeColumns<'de>>::COLUMNS,
+                        ),
+                    )?;
+                });
+                values.push(quote!(#tmp));
+            }
+        }
+        let ctor = match &variant.fields {
+            Fields::Unit => quote!(Self::#vident),
+            Fields::Unnamed(_) => quote!(Self::#vident(#(#values),*)),
+            Fields::Named(_) => {
+                let members = models.iter().map(|m| &m.member);
+                quote!(Self::#vident { #(#members: #values),* })
+            }
+        };
+        de_arms.push(quote! {
+            #tag => {
+                let mut __rest = &mut cursors[#offset..];
+                #(#reads)*
+                ::core::result::Result::Ok(#ctor)
+            }
+        });
+    }
+    let de_body = quote! {
+        let __tag = cursors[0usize].varint()?;
+        match __tag {
+            #(#de_arms,)*
+            __other => ::core::result::Result::Err(
+                ::carbonite::columnar::__invalid_variant(__other),
+            ),
+        }
+    };
+
+    Ok(ColumnarParts {
+        ser_columns,
+        ser_body,
+        de_columns,
+        de_body,
+    })
+}
+
+/// Builds a match pattern binding every non-skipped field, returning the
+/// pattern and the `(binding, type)` pairs in field order.
+fn variant_pattern<'a>(
+    vident: &syn::Ident,
+    fields: &Fields,
+    models: &'a [FieldModel<'a>],
+) -> (TokenStream2, Vec<(syn::Ident, &'a syn::Type)>) {
+    match fields {
+        Fields::Unit => (quote!(Self::#vident), Vec::new()),
+        Fields::Unnamed(_) => {
+            let mut pats = Vec::new();
+            let mut bindings = Vec::new();
+            for (index, m) in models.iter().enumerate() {
+                if m.skip {
+                    pats.push(quote!(_));
+                } else {
+                    let binding = format_ident!("__binding{index}");
+                    pats.push(quote!(#binding));
+                    bindings.push((binding, m.ty));
+                }
+            }
+            (quote!(Self::#vident(#(#pats),*)), bindings)
+        }
+        Fields::Named(_) => {
+            let mut pats = Vec::new();
+            let mut bindings = Vec::new();
+            for (index, m) in models.iter().enumerate() {
+                let member = &m.member;
+                if m.skip {
+                    pats.push(quote!(#member: _));
+                } else {
+                    let binding = format_ident!("__binding{index}");
+                    pats.push(quote!(#member: #binding));
+                    bindings.push((binding, m.ty));
+                }
+            }
+            (quote!(Self::#vident { #(#pats),* }), bindings)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

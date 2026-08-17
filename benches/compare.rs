@@ -98,7 +98,13 @@ pub fn logs(n: u32) -> Vec<LogRecord> {
 
 fn bench_dataset<T>(c: &mut Criterion, name: &str, data: &Vec<T>)
 where
-    T: Serialize + serde::de::DeserializeOwned + StaticSchema + PartialEq + std::fmt::Debug,
+    T: Serialize
+        + serde::de::DeserializeOwned
+        + StaticSchema
+        + carbonite::SerializeColumns
+        + for<'de> carbonite::DeserializeColumns<'de>
+        + PartialEq
+        + std::fmt::Debug,
 {
     let schema = <Vec<T>>::schema();
     let ser = carbonite::Serializer::new(&schema);
@@ -106,16 +112,21 @@ where
 
     let carb_blob = ser.to_vec(data).unwrap();
     let post_blob = postcard::to_allocvec(data).unwrap();
-    // Sanity: both formats round-trip the same value.
+    // Sanity: the two carbonite writers agree, and everything round-trips.
+    assert_eq!(carb_blob, ser.to_vec_columns(data).unwrap());
     assert_eq!(&de.from_slice(&carb_blob).unwrap(), data);
+    assert_eq!(&de.from_slice_columns(&carb_blob).unwrap(), data);
     assert_eq!(&postcard::from_bytes::<Vec<T>>(&post_blob).unwrap(), data);
 
     let rows = data.len() as u64;
 
     let mut group = c.benchmark_group(format!("serialize/{name}"));
     group.throughput(Throughput::Elements(rows));
-    group.bench_function("carbonite", |b| {
+    group.bench_function("carbonite-serde", |b| {
         b.iter(|| ser.to_vec(black_box(data)).unwrap())
+    });
+    group.bench_function("carbonite-columnar", |b| {
+        b.iter(|| ser.to_vec_columns(black_box(data)).unwrap())
     });
     group.bench_function("postcard", |b| {
         b.iter(|| postcard::to_allocvec(black_box(data)).unwrap())
@@ -124,8 +135,11 @@ where
 
     let mut group = c.benchmark_group(format!("deserialize/{name}"));
     group.throughput(Throughput::Elements(rows));
-    group.bench_function("carbonite", |b| {
+    group.bench_function("carbonite-serde", |b| {
         b.iter(|| de.from_slice(black_box(&carb_blob)).unwrap())
+    });
+    group.bench_function("carbonite-columnar", |b| {
+        b.iter(|| de.from_slice_columns(black_box(&carb_blob)).unwrap())
     });
     group.bench_function("postcard", |b| {
         b.iter(|| postcard::from_bytes::<Vec<T>>(black_box(&post_blob)).unwrap())

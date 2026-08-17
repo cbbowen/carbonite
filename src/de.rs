@@ -15,48 +15,10 @@ use serde::de::{
     VariantAccess, Visitor,
 };
 
+use crate::columnar::{ColumnCursor as Cursor, DeserializeColumns};
 use crate::error::{Error, Result};
 use crate::layout::{LNode, Layout};
 use crate::schema::{Primitive, Schema, SchemaNode, VariantNode};
-use crate::varint;
-
-/// A reading position within one column's bytes.
-struct Cursor<'de> {
-    buf: &'de [u8],
-    pos: usize,
-}
-
-impl<'de> Cursor<'de> {
-    fn take(&mut self, n: usize) -> Result<&'de [u8]> {
-        let end = self.pos.checked_add(n).ok_or(Error::UnexpectedEof)?;
-        let slice = self.buf.get(self.pos..end).ok_or(Error::UnexpectedEof)?;
-        self.pos = end;
-        Ok(slice)
-    }
-
-    fn fixed<const N: usize>(&mut self) -> Result<[u8; N]> {
-        let slice = self.take(N)?;
-        Ok(<[u8; N]>::try_from(slice).expect("take returned exactly N bytes"))
-    }
-
-    fn byte(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn varint(&mut self) -> Result<u64> {
-        let (value, used) = varint::read(&self.buf[self.pos..])?;
-        self.pos += used;
-        Ok(value)
-    }
-
-    fn varint_len(&mut self) -> Result<usize> {
-        usize::try_from(self.varint()?).map_err(|_| Error::Malformed("length overflows usize"))
-    }
-
-    fn at_end(&self) -> bool {
-        self.pos == self.buf.len()
-    }
-}
 
 /// Deserializes values of type `T` from blobs written with a given schema.
 ///
@@ -145,6 +107,47 @@ impl<T: ?Sized> Deserializer<T> {
     /// Fails if the header is malformed or the column layout does not match
     /// the schema.
     pub fn rows<'a, 'de>(&'a self, input: &'de [u8]) -> Result<Rows<'a, 'de, T>> {
+        let (row_count, cursors) = self.open(input)?;
+        Ok(Rows {
+            de: self,
+            cursors,
+            remaining: row_count,
+        })
+    }
+
+    /// Deserializes a single-value blob through the monomorphized columnar
+    /// fast path from `#[derive(Schema)]` — no serde dispatch at all.
+    ///
+    /// Unlike [`Self::from_slice`], this path cannot reconcile schema
+    /// differences: it requires the blob's schema to equal the type's own
+    /// [`StaticSchema`](crate::StaticSchema). For older or foreign schemas,
+    /// use [`Self::from_slice`].
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::SchemaMismatch`] when the schema differs from the
+    /// type's, and on any of the malformed-input failures of
+    /// [`Self::from_slice`].
+    pub fn from_slice_columns<'de>(&self, input: &'de [u8]) -> Result<T>
+    where
+        T: DeserializeColumns<'de>,
+    {
+        if !self.fast && T::schema_node() != *self.schema.node() {
+            return Err(columnar_schema_mismatch());
+        }
+        let (row_count, mut cursors) = self.open(input)?;
+        if row_count != 1 {
+            return Err(Error::Malformed("expected a single-value blob"));
+        }
+        let value = T::deserialize_columns(&mut cursors)?;
+        if !cursors.iter().all(Cursor::at_end) {
+            return Err(Error::TrailingBytes);
+        }
+        Ok(value)
+    }
+
+    /// Parses the blob header and slices one cursor per column.
+    fn open<'de>(&self, input: &'de [u8]) -> Result<(u64, Vec<Cursor<'de>>)> {
         let mut header = Cursor { buf: input, pos: 0 };
         let row_count = header.varint()?;
         let column_count = header.varint()?;
@@ -165,11 +168,14 @@ impl<T: ?Sized> Deserializer<T> {
         if !header.at_end() {
             return Err(Error::TrailingBytes);
         }
-        Ok(Rows {
-            de: self,
-            cursors,
-            remaining: row_count,
-        })
+        Ok((row_count, cursors))
+    }
+}
+
+pub(crate) fn columnar_schema_mismatch() -> Error {
+    Error::SchemaMismatch {
+        expected: "the type's own static schema (columnar fast path)".to_owned(),
+        found: "a schema that differs from it; use the serde path for evolution".to_owned(),
     }
 }
 

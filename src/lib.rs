@@ -80,6 +80,30 @@
 //! # Ok::<(), carbonite::Error>(())
 //! ```
 //!
+//! The derive also generates a **monomorphized columnar fast path**
+//! ([`SerializeColumns`] / [`DeserializeColumns`]): straight-line code that
+//! reads and writes the exact same bytes as the serde path, with no schema
+//! interpretation per value. Since serialization always targets the type's
+//! *current* schema, `to_vec_columns` is the preferred writer for derived
+//! types; on the read side the columnar path applies when the blob's schema
+//! equals the type's own, and the serde path handles everything else
+//! (older files, foreign writers — anything needing evolution):
+//!
+//! ```
+//! # use serde::{Serialize, Deserialize};
+//! # #[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug)]
+//! # struct Pixel { x: u16, y: u16, luma: f32 }
+//! use carbonite::{Deserializer, Serializer, StaticSchema};
+//!
+//! let schema = Pixel::schema();
+//! let pixel = Pixel { x: 3, y: 4, luma: 0.5 };
+//!
+//! let blob = Serializer::new(&schema).to_vec_columns(&pixel)?;
+//! let back: Pixel = Deserializer::new_static(schema).from_slice_columns(&blob)?;
+//! assert_eq!(back, pixel);
+//! # Ok::<(), carbonite::Error>(())
+//! ```
+//!
 //! # Limitations
 //!
 //! The data layer is not self-describing, so serde features that require a
@@ -91,6 +115,7 @@
 //! be complete. Adding a field requires `#[serde(default)]` to read old data,
 //! exactly as with JSON.
 
+pub mod columnar;
 mod de;
 mod error;
 mod layout;
@@ -101,6 +126,7 @@ mod static_schema;
 mod trace;
 mod varint;
 
+pub use columnar::{DeserializeColumns, SerializeColumns};
 pub use de::{Deserializer, Rows};
 pub use error::{Error, Result};
 pub use schema::{Primitive, Schema, SchemaNode, VariantNode};

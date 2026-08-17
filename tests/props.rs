@@ -5,14 +5,14 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+#[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug, Clone)]
 enum Shade {
     Plain,
     Tinted(u8),
     Custom { red: f32, alpha: Option<f64> },
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+#[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug, Clone)]
 struct Item {
     id: u64,
     label: String,
@@ -55,6 +55,20 @@ proptest! {
     fn arbitrary_values_round_trip(items in proptest::collection::vec(item_strategy(), 0..10)) {
         let bytes = carbonite::to_vec(&items).unwrap();
         let back: Vec<Item> = carbonite::from_slice(&bytes).unwrap();
+        prop_assert_eq!(back, items);
+    }
+
+    #[test]
+    fn columnar_path_matches_serde_path(items in proptest::collection::vec(item_strategy(), 0..10)) {
+        use carbonite::StaticSchema;
+        let schema = <Vec<Item>>::schema();
+        let ser = carbonite::Serializer::new(&schema);
+        let serde_bytes = ser.to_vec(&items).unwrap();
+        let columnar_bytes = ser.to_vec_columns(&items).unwrap();
+        prop_assert_eq!(&serde_bytes, &columnar_bytes);
+
+        let de = carbonite::Deserializer::new_static(schema);
+        let back: Vec<Item> = de.from_slice_columns(&columnar_bytes).unwrap();
         prop_assert_eq!(back, items);
     }
 

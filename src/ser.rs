@@ -5,6 +5,8 @@ use std::marker::PhantomData;
 
 use serde::ser::{self, Serialize};
 
+use crate::columnar::SerializeColumns;
+use crate::de::columnar_schema_mismatch;
 use crate::error::{Error, Result};
 use crate::layout::{ColId, LNode, Layout};
 use crate::schema::{Primitive, Schema, SchemaNode, VariantNode};
@@ -50,6 +52,29 @@ impl<'s, T: ?Sized> Serializer<'s, T> {
         Ok(batch.finish())
     }
 
+    /// Serializes a single value through the monomorphized columnar fast
+    /// path from `#[derive(Schema)]` — no serde dispatch at all.
+    ///
+    /// Serialization always targets the type's *current* schema, so this is
+    /// the preferred writer whenever `T` carries the derive; the serde-driven
+    /// [`Serializer::to_vec`] remains for types without it. Requires this
+    /// serializer's schema to equal the type's own
+    /// [`StaticSchema`](crate::StaticSchema) (it is, when built from
+    /// `T::schema()`).
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::SchemaMismatch`] when the schema differs from the
+    /// type's, plus the value-level failures of [`Serializer::to_vec`].
+    pub fn to_vec_columns(&self, value: &T) -> Result<Vec<u8>>
+    where
+        T: SerializeColumns,
+    {
+        let mut batch = self.batch();
+        batch.push_columns(value)?;
+        Ok(batch.finish())
+    }
+
     /// Starts a batch: many values serialized against one schema into one
     /// blob, sharing columns.
     pub fn batch(&self) -> Batch<'_, T> {
@@ -59,6 +84,7 @@ impl<'s, T: ?Sized> Serializer<'s, T> {
             columns: vec![Vec::new(); self.layout.columns],
             rollback: Vec::with_capacity(self.layout.columns),
             rows: 0,
+            static_verified: false,
             _marker: PhantomData,
         }
     }
@@ -73,6 +99,9 @@ pub struct Batch<'a, T: ?Sized> {
     columns: Vec<Vec<u8>>,
     rollback: Vec<usize>,
     rows: u64,
+    /// Whether the schema has been verified equal to `T`'s static schema
+    /// (checked once, on the first `push_columns`).
+    static_verified: bool,
     _marker: PhantomData<fn(&T)>,
 }
 
@@ -97,6 +126,42 @@ impl<T: ?Sized> Batch<'_, T> {
             columns: &mut self.columns,
         });
         match result {
+            Ok(()) => {
+                self.rows += 1;
+                Ok(())
+            }
+            Err(err) => {
+                for (column, &len) in self.columns.iter_mut().zip(&self.rollback) {
+                    column.truncate(len);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Appends one value as a row through the monomorphized columnar fast
+    /// path from `#[derive(Schema)]`. See [`Serializer::to_vec_columns`].
+    ///
+    /// Rows written by `push` and `push_columns` are byte-identical, so the
+    /// two can be mixed freely within one batch.
+    ///
+    /// # Errors
+    ///
+    /// Same failure modes as [`Serializer::to_vec_columns`]; on error the
+    /// batch is left unchanged.
+    pub fn push_columns(&mut self, value: &T) -> Result<()>
+    where
+        T: SerializeColumns,
+    {
+        if !self.static_verified {
+            if T::schema_node() != *self.root_node {
+                return Err(columnar_schema_mismatch());
+            }
+            self.static_verified = true;
+        }
+        self.rollback.clear();
+        self.rollback.extend(self.columns.iter().map(Vec::len));
+        match value.serialize_columns(&mut self.columns) {
             Ok(()) => {
                 self.rows += 1;
                 Ok(())
