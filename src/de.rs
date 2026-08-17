@@ -505,14 +505,32 @@ fn visit_product<'s, 'de, V: Visitor<'de>>(
     fast: bool,
     visitor: V,
 ) -> Result<V::Value> {
-    let mut index = 0usize;
-    let value = visitor.visit_seq(FieldsSeq {
+    // The schemas are identical, so the visitor asks for every field and there
+    // is nothing to drain. Hand the sequence over directly and keep the hot
+    // path free of the bookkeeping the reconciling one needs.
+    if fast {
+        return visitor.visit_seq(FieldsSeq {
+            fields,
+            lfields,
+            cursors,
+            index: 0,
+            fast,
+        });
+    }
+
+    // Reconciling: keep the sequence afterwards (serde's blanket
+    // `SeqAccess for &mut A` lends it out) to see how far the visitor got. A
+    // reader with fewer fields than the writer stops early, and the fields it
+    // never asked for still have to be skipped.
+    let mut seq = FieldsSeq {
         fields,
         lfields,
         cursors: &mut *cursors,
-        index: &mut index,
+        index: 0,
         fast,
-    })?;
+    };
+    let value = visitor.visit_seq(&mut seq)?;
+    let mut index = seq.index;
     while let Some((node, lnode)) = fields.get(index).zip(lfields.get(index)) {
         ValueDeserializer::skip(node, lnode, cursors)?;
         index += 1;
@@ -1053,8 +1071,34 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
         fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value> {
+        // The writer recorded names too — far and away the common case, so it
+        // is handled here rather than round-tripping through `dispatch`.
+        if let (
+            SchemaNode::Struct {
+                fields: written, ..
+            },
+            LNode::Product(lfields),
+        ) = (self.node, self.lnode)
+        {
+            return if self.fast {
+                visit_product(
+                    FieldList::Named(written),
+                    lfields,
+                    self.cursors,
+                    self.fast,
+                    visitor,
+                )
+            } else {
+                visitor.visit_map(StructMap {
+                    fields: written,
+                    lfields,
+                    cursors: self.cursors,
+                    index: 0,
+                    fast: self.fast,
+                })
+            };
+        }
         match self.product_fields() {
-            // The writer recorded names; `dispatch` matches on them.
             Some((FieldList::Named(_), _)) => self.dispatch(visitor),
             // Not a product at all: a plain value the reader has since
             // promoted to a struct of its own. It is a one-field product whose
@@ -1183,16 +1227,11 @@ impl<'s> FieldList<'s> {
 }
 
 /// Positional fields: tuples, tuple structs/variants, and fast-path structs.
-///
-/// `index` is borrowed rather than owned so the caller can see how far the
-/// visitor got: a reader with fewer fields than the writer stops early, and
-/// the fields it never asked for still have to be skipped (see
-/// [`ValueDeserializer::visit_product`]).
 struct FieldsSeq<'s, 'c, 'de> {
     fields: FieldList<'s>,
     lfields: &'s [LNode],
     cursors: &'c mut [Cursor<'de>],
-    index: &'c mut usize,
+    index: usize,
     fast: bool,
 }
 
@@ -1202,12 +1241,12 @@ impl<'de> SeqAccess<'de> for FieldsSeq<'_, '_, 'de> {
     fn next_element_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<Option<S::Value>> {
         let Some((node, lnode)) = self
             .fields
-            .get(*self.index)
-            .zip(self.lfields.get(*self.index))
+            .get(self.index)
+            .zip(self.lfields.get(self.index))
         else {
             return Ok(None);
         };
-        *self.index += 1;
+        self.index += 1;
         seed.deserialize(ValueDeserializer {
             node,
             lnode,
@@ -1218,7 +1257,7 @@ impl<'de> SeqAccess<'de> for FieldsSeq<'_, '_, 'de> {
     }
 
     fn size_hint(&self) -> Option<usize> {
-        Some(self.fields.len() - *self.index)
+        Some(self.fields.len() - self.index)
     }
 }
 
