@@ -17,6 +17,7 @@
 //! [`needs_positional_names`]. The reverse — a named file read into a tuple —
 //! is refused, since a tuple has nowhere to make that declaration.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
@@ -35,7 +36,10 @@ use crate::schema::{Primitive, Schema, SchemaNode, VariantNode};
 /// Deserializes values of type `T` from blobs written with a given schema.
 ///
 /// The schema passed in is the **writer's** schema — possibly from an older
-/// version of `T`. One `Deserializer` can decode any number of blobs.
+/// version of `T`. It is taken [by value or by reference](Self::new): borrow
+/// to share one long-lived schema across engines, hand it over when it was
+/// parsed from the wire for this deserializer alone. One `Deserializer` can
+/// decode any number of blobs.
 ///
 /// # Untrusted input
 ///
@@ -44,13 +48,13 @@ use crate::schema::{Primitive, Schema, SchemaNode, VariantNode};
 /// they size an allocation or drive a loop, so decoding work stays
 /// proportional to the input. Malformed input yields an [`Error`], never a
 /// panic or an unbounded allocation.
-pub struct Deserializer<T: ?Sized> {
-    schema: Schema<T>,
+pub struct Deserializer<'s, T: ?Sized> {
+    schema: Cow<'s, Schema<T>>,
     layout: Layout,
     fast: bool,
 }
 
-impl<T: ?Sized> fmt::Debug for Deserializer<T> {
+impl<T: ?Sized> fmt::Debug for Deserializer<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Deserializer")
             .field("schema", &format_args!("{}", self.schema))
@@ -60,7 +64,7 @@ impl<T: ?Sized> fmt::Debug for Deserializer<T> {
     }
 }
 
-impl<T> Deserializer<T> {
+impl<'s, T> Deserializer<'s, T> {
     /// Builds a deserializer, tracing `T` to detect whether the fast
     /// positional path can be used (it can whenever the writer's schema is
     /// identical to `T`'s own).
@@ -77,25 +81,27 @@ impl<T> Deserializer<T> {
     /// successfully and then reject the sequence; give such a type
     /// [`Self::new_untraced`], which always uses the name-matched path.
     #[must_use]
-    pub fn new(schema: Schema<T>) -> Self
+    pub fn new(schema: impl Into<Cow<'s, Schema<T>>>) -> Self
     where
         T: DeserializeOwned,
     {
+        let schema = schema.into();
         let fast = crate::trace::trace::<T>().is_ok_and(|local| local == *schema.node());
         Self::build(schema, fast)
     }
 }
 
-impl<T: ?Sized> Deserializer<T> {
+impl<'s, T: ?Sized> Deserializer<'s, T> {
     /// Like [`Self::new`], but uses the compile-time schema from
     /// `#[derive(Schema)]` for the fast-path check instead of tracing.
     /// Unlike [`Self::new`], this also works for types that borrow from the
     /// input.
     #[must_use]
-    pub fn new_static(schema: Schema<T>) -> Self
+    pub fn new_static(schema: impl Into<Cow<'s, Schema<T>>>) -> Self
     where
         T: crate::StaticSchema,
     {
+        let schema = schema.into();
         let fast = T::schema_node() == *schema.node();
         Self::build(schema, fast)
     }
@@ -104,11 +110,11 @@ impl<T: ?Sized> Deserializer<T> {
     /// path. Use this for types that borrow from the input (`&str` fields)
     /// and don't implement [`StaticSchema`](crate::StaticSchema).
     #[must_use]
-    pub fn new_untraced(schema: Schema<T>) -> Self {
-        Self::build(schema, false)
+    pub fn new_untraced(schema: impl Into<Cow<'s, Schema<T>>>) -> Self {
+        Self::build(schema.into(), false)
     }
 
-    pub(crate) fn build(schema: Schema<T>, fast: bool) -> Self {
+    pub(crate) fn build(schema: Cow<'s, Schema<T>>, fast: bool) -> Self {
         let layout = Layout::new(schema.node());
         Deserializer {
             schema,
@@ -261,7 +267,7 @@ pub(crate) fn columnar_schema_mismatch() -> Error {
 /// After an error, iteration fuses (yields `None`); a decoding error mid-blob
 /// leaves the column cursors in an unspecified position.
 pub struct Rows<'a, 'de, T: ?Sized> {
-    de: &'a Deserializer<T>,
+    de: &'a Deserializer<'a, T>,
     cursors: Vec<Cursor<'de>>,
     remaining: u64,
 }

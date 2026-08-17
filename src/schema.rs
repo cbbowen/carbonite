@@ -681,6 +681,22 @@ impl<T: ?Sized> Clone for Schema<T> {
     }
 }
 
+/// [`Serializer`](crate::Serializer) and [`Deserializer`](crate::Deserializer)
+/// accept a schema by value or by reference through these, so a schema built
+/// once can back any number of engines, while one parsed from the wire can be
+/// handed over outright.
+impl<'s, T: ?Sized> From<Schema<T>> for std::borrow::Cow<'s, Schema<T>> {
+    fn from(schema: Schema<T>) -> Self {
+        std::borrow::Cow::Owned(schema)
+    }
+}
+
+impl<'s, T: ?Sized> From<&'s Schema<T>> for std::borrow::Cow<'s, Schema<T>> {
+    fn from(schema: &'s Schema<T>) -> Self {
+        std::borrow::Cow::Borrowed(schema)
+    }
+}
+
 impl<T: ?Sized> fmt::Debug for Schema<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Schema").field(&self.root).finish()

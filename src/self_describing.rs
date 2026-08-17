@@ -83,18 +83,21 @@ impl<T: ?Sized> fmt::Debug for SelfDescribingSerializer<'_, T> {
 }
 
 impl<'s, T: ?Sized> SelfDescribingSerializer<'s, T> {
-    /// Builds a self-describing serializer for `schema`.
+    /// Builds a self-describing serializer for `schema`, borrowed or owned —
+    /// see [`Serializer::new`].
     #[must_use]
-    pub fn new(schema: &'s Schema<T>) -> Self {
+    pub fn new(schema: impl Into<std::borrow::Cow<'s, Schema<T>>>) -> Self {
+        let inner = Serializer::new(schema);
+        let schema_bytes = inner.schema().to_bytes();
         SelfDescribingSerializer {
-            inner: Serializer::new(schema),
-            schema_bytes: schema.to_bytes(),
+            inner,
+            schema_bytes,
         }
     }
 
     /// The schema this serializer embeds.
     #[must_use]
-    pub fn schema(&self) -> &'s Schema<T> {
+    pub fn schema(&self) -> &Schema<T> {
         self.inner.schema()
     }
 
@@ -239,10 +242,10 @@ impl<T: ?Sized> SelfDescribingDeserializer<T> {
             .and_then(|(de, data)| de.from_slice_columns(data))
     }
 
-    fn deserializer<'de>(&self, input: &'de [u8]) -> Result<(Deserializer<T>, &'de [u8])> {
+    fn deserializer<'de>(&self, input: &'de [u8]) -> Result<(Deserializer<'_, T>, &'de [u8])> {
         let (schema, data) = split::<T>(input)?;
         let fast = self.local.as_ref() == Some(schema.node());
-        Ok((Deserializer::build(schema, fast), data))
+        Ok((Deserializer::build(schema.into(), fast), data))
     }
 }
 

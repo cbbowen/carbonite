@@ -1,6 +1,7 @@
 //! Columnar serialization: a [`serde::Serializer`] that walks the schema in
 //! lockstep with the value and routes every leaf into its column buffer.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -15,8 +16,8 @@ use crate::varint;
 
 /// Serializes values of type `T` according to a [`Schema<T>`].
 ///
-/// One `Serializer` can produce any number of blobs; the schema is borrowed,
-/// never re-traced.
+/// One `Serializer` can produce any number of blobs; the schema is taken
+/// [by value or by reference](Self::new), never re-traced.
 ///
 /// # Why there is no `to_writer`
 ///
@@ -27,7 +28,7 @@ use crate::varint;
 /// rather than real streaming. What it *would* have saved is the allocation,
 /// and [`Batch::finish_into`] saves that directly.
 pub struct Serializer<'s, T: ?Sized> {
-    schema: &'s Schema<T>,
+    schema: Cow<'s, Schema<T>>,
     layout: Layout,
 }
 
@@ -41,19 +42,20 @@ impl<T: ?Sized> fmt::Debug for Serializer<'_, T> {
 }
 
 impl<'s, T: ?Sized> Serializer<'s, T> {
-    /// Builds a serializer for `schema`.
+    /// Builds a serializer for `schema`, borrowed (`&schema`) or owned
+    /// (`schema`) — borrow to share one long-lived schema across engines,
+    /// hand it over when the serializer is the only user.
     #[must_use]
-    pub fn new(schema: &'s Schema<T>) -> Self {
-        Serializer {
-            schema,
-            layout: Layout::new(schema.node()),
-        }
+    pub fn new(schema: impl Into<Cow<'s, Schema<T>>>) -> Self {
+        let schema = schema.into();
+        let layout = Layout::new(schema.node());
+        Serializer { schema, layout }
     }
 
     /// The schema this serializer writes.
     #[must_use]
-    pub fn schema(&self) -> &'s Schema<T> {
-        self.schema
+    pub fn schema(&self) -> &Schema<T> {
+        &self.schema
     }
 
     /// Serializes a single value into a standalone data blob.

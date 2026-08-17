@@ -321,3 +321,41 @@ fn a_renamed_carbonite_dependency_still_derives() {
     );
     assert_eq!(Shade::schema(), Schema::<Shade>::new().unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// Schema ownership.
+// ---------------------------------------------------------------------------
+
+/// Every engine takes its schema borrowed (`&schema`, to share one long-lived
+/// schema) or owned (`schema`, when it was parsed from the wire for this
+/// engine alone). Both forms must keep compiling.
+#[test]
+fn engines_take_schemas_borrowed_or_owned() {
+    let value = Reading {
+        sensor: 1,
+        celsius: 20.0,
+    };
+    let schema = Reading::schema();
+
+    let borrowed = Serializer::new(&schema).to_vec_columns(&value).unwrap();
+    let owned = Serializer::new(Reading::schema())
+        .to_vec_columns(&value)
+        .unwrap();
+    assert_eq!(borrowed, owned);
+
+    let de_borrowed = Deserializer::new_static(&schema);
+    let de_owned = Deserializer::new_static(Reading::schema());
+    let via_borrowed: Reading = de_borrowed.from_slice_columns(&borrowed).unwrap();
+    let via_owned: Reading = de_owned.from_slice_columns(&owned).unwrap();
+    assert_eq!(via_borrowed, via_owned);
+
+    let framed = SelfDescribingSerializer::new(&schema)
+        .to_vec_columns(&value)
+        .unwrap();
+    assert_eq!(
+        framed,
+        SelfDescribingSerializer::new(Reading::schema())
+            .to_vec_columns(&value)
+            .unwrap()
+    );
+}
