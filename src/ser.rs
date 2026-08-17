@@ -17,6 +17,15 @@ use crate::varint;
 ///
 /// One `Serializer` can produce any number of blobs; the schema is borrowed,
 /// never re-traced.
+///
+/// # Why there is no `to_writer`
+///
+/// A blob's header records every column's byte length, so nothing can be
+/// emitted until all the columns are complete — and on the read side the
+/// decoder addresses columns by offset, so it needs the whole blob in memory
+/// anyway. A `to_writer`/`from_reader` pair would be sugar over `Vec<u8>`
+/// rather than real streaming. What it *would* have saved is the allocation,
+/// and [`Batch::finish_into`] saves that directly.
 pub struct Serializer<'s, T: ?Sized> {
     schema: &'s Schema<T>,
     layout: Layout,

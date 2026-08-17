@@ -27,6 +27,12 @@
 //! [`checked_count`] before it is used to size an allocation or drive a loop.
 //! [`ColumnCursor::new`] builds a cursor over a byte slice so an
 //! implementation can be tested directly.
+//!
+//! The two traits and [`ColumnCursor`] are re-exported at the crate root,
+//! since they appear in each other's signatures. The rest of this module —
+//! [`write_varint`], [`checked_count`], [`MAX_ZERO_COLUMN_REPEAT`] — is the
+//! toolkit for writing an implementation by hand, and stays behind the module
+//! path.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, LinkedList, VecDeque};

@@ -22,6 +22,43 @@ struct Item {
     table: BTreeMap<String, u16>,
 }
 
+/// Adjacent and nested variable-length collections, including elements that
+/// occupy no columns at all. Decoding bounds every claimed length against the
+/// bytes remaining across all columns; this type is where that bound is
+/// loosest, so it is where a false rejection would show up first.
+#[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug, Clone)]
+struct Nested {
+    grid: Vec<Vec<u8>>,
+    flags: Vec<Option<()>>,
+    units: Vec<()>,
+    pairs: Vec<(Vec<u16>, String)>,
+    lookup: BTreeMap<u8, Vec<u8>>,
+}
+
+fn nested_strategy() -> impl Strategy<Value = Nested> {
+    (
+        proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..6), 0..6),
+        proptest::collection::vec(proptest::option::of(Just(())), 0..8),
+        proptest::collection::vec(Just(()), 0..8),
+        proptest::collection::vec(
+            (proptest::collection::vec(any::<u16>(), 0..4), ".{0,4}"),
+            0..4,
+        ),
+        proptest::collection::btree_map(
+            any::<u8>(),
+            proptest::collection::vec(any::<u8>(), 0..4),
+            0..4,
+        ),
+    )
+        .prop_map(|(grid, flags, units, pairs, lookup)| Nested {
+            grid,
+            flags,
+            units,
+            pairs,
+            lookup,
+        })
+}
+
 fn shade_strategy() -> impl Strategy<Value = Shade> {
     prop_oneof![
         Just(Shade::Plain),
@@ -70,6 +107,32 @@ proptest! {
         let de = carbonite::Deserializer::new_static(schema);
         let back: Vec<Item> = de.from_slice_columns(&columnar_bytes).unwrap();
         prop_assert_eq!(back, items);
+    }
+
+    /// Nothing carbonite itself writes may be rejected by the length bounds
+    /// it enforces on read, on either path.
+    #[test]
+    fn nested_collections_are_never_falsely_rejected(
+        values in proptest::collection::vec(nested_strategy(), 0..6)
+    ) {
+        use carbonite::StaticSchema;
+
+        let schema = <Vec<Nested>>::schema();
+        let ser = carbonite::Serializer::new(&schema);
+        let bytes = ser.to_vec_columns(&values).unwrap();
+        prop_assert_eq!(&bytes, &ser.to_vec(&values).unwrap());
+
+        let de = carbonite::Deserializer::new_static(schema);
+        let via_serde: Vec<Nested> = de.from_slice(&bytes).unwrap();
+        let via_columns: Vec<Nested> = de.from_slice_columns(&bytes).unwrap();
+        prop_assert_eq!(&via_serde, &values);
+        prop_assert_eq!(&via_columns, &values);
+
+        // ...and the same values must survive being skipped by a reader that
+        // does not know the field, which walks the columns without decoding.
+        let framed = carbonite::to_vec_static(&values).unwrap();
+        let ignored: Vec<serde::de::IgnoredAny> = carbonite::from_slice(&framed).unwrap();
+        prop_assert_eq!(ignored.len(), values.len());
     }
 
     #[test]
