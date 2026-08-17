@@ -123,14 +123,16 @@ scope would close the hazard outright, but the `Serialize` impl lacks a
 
 ## 5. API design
 
-- [ ] **Ownership asymmetry:** `Serializer::new(&schema)` borrows;
-  `Deserializer::new(schema)` owns. Pick one convention (borrowing both
-  composes better with a long-lived schema).
-- [ ] **Fast-path std coverage gaps:** `PathBuf`, `IpAddr`/`SocketAddr`,
-  `Range<T>`, `Bound<T>`, `Wrapping<T>`, `Box<str>`, `Box<[T]>` fields are
-  compile errors against `StaticSchema` today; `#[carbonite(serde)]` works
-  but costs per-field runtime dispatch for types with perfectly static
-  shapes. Mechanical to add.
+- [x] **Ownership asymmetry:** every engine (`Serializer`, `Deserializer`,
+  `SelfDescribingSerializer`) now holds a `Cow<Schema<T>>` and its
+  constructors accept `&schema` or `schema`, so both the share-one-schema and
+  the parsed-from-the-wire flows are first-class and every existing call form
+  keeps compiling. Locked in by `engines_take_schemas_borrowed_or_owned`.
+- [x] **Fast-path std coverage gaps:** added `StaticSchema` +
+  `SerializeColumns` + `DeserializeColumns` for `PathBuf`/`Path`, the
+  `IpAddr`/`SocketAddr` families, `Range`/`RangeInclusive`/`Bound`,
+  `Wrapping`, `[T]`, `Box<str>`, and `Box<[T]>`, each pinned against the
+  traced schema and the serde path's bytes in `tests/std_types.rs`.
 
 ## 6. Maintainability
 

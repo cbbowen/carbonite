@@ -153,6 +153,16 @@ impl<T: StaticSchema> StaticSchema for Option<T> {
     }
 }
 
+impl<T: StaticSchema> StaticSchema for [T] {
+    fn schema_node() -> SchemaNode {
+        SchemaNode::Seq(Box::new(T::schema_node()))
+    }
+    #[inline]
+    fn columns() -> usize {
+        1 + T::columns()
+    }
+}
+
 macro_rules! seq_impls {
     ($($ty:ident $(: $extra:path)?,)*) => {$(
         impl<T: StaticSchema $(+ $extra)?> StaticSchema for $ty<T> {
@@ -318,6 +328,173 @@ impl<T: ?Sized> StaticSchema for PhantomData<T> {
     }
 }
 
+impl StaticSchema for std::path::Path {
+    fn schema_node() -> SchemaNode {
+        // serde puts paths on the wire as strings (and errors on non-UTF-8).
+        SchemaNode::String
+    }
+    #[inline]
+    fn columns() -> usize {
+        2
+    }
+}
+
+impl StaticSchema for std::path::PathBuf {
+    fn schema_node() -> SchemaNode {
+        SchemaNode::String
+    }
+    #[inline]
+    fn columns() -> usize {
+        2
+    }
+}
+
+impl<T: StaticSchema> StaticSchema for std::num::Wrapping<T> {
+    fn schema_node() -> SchemaNode {
+        // serde's impl is transparent: the wrapper never reaches the wire.
+        T::schema_node()
+    }
+    #[inline]
+    fn columns() -> usize {
+        T::columns()
+    }
+    const FIXED_WIDTH: Option<usize> = T::FIXED_WIDTH;
+}
+
+/// serde serializes each `Range*` type as a struct of its bounds.
+macro_rules! range_impls {
+    ($($ty:ident { $($field:literal),+ },)*) => {$(
+        impl<T: StaticSchema> StaticSchema for std::ops::$ty<T> {
+            fn schema_node() -> SchemaNode {
+                SchemaNode::Struct {
+                    name: stringify!($ty).to_owned(),
+                    fields: vec![$(($field.to_owned(), T::schema_node())),+],
+                }
+            }
+            #[inline]
+            fn columns() -> usize {
+                [$($field),+].len() * T::columns()
+            }
+        }
+    )*};
+}
+
+range_impls! {
+    Range { "start", "end" },
+    RangeInclusive { "start", "end" },
+}
+
+impl<T: StaticSchema> StaticSchema for std::ops::Bound<T> {
+    fn schema_node() -> SchemaNode {
+        SchemaNode::Enum {
+            name: "Bound".to_owned(),
+            variants: vec![
+                ("Unbounded".to_owned(), VariantNode::Unit),
+                (
+                    "Included".to_owned(),
+                    VariantNode::Newtype(Box::new(T::schema_node())),
+                ),
+                (
+                    "Excluded".to_owned(),
+                    VariantNode::Newtype(Box::new(T::schema_node())),
+                ),
+            ],
+        }
+    }
+    #[inline]
+    fn columns() -> usize {
+        1 + 2 * T::columns()
+    }
+}
+
+// serde's non-human-readable network forms: addresses are their octet
+// arrays, socket addresses are `(ip, port)` tuples, and the version-agnostic
+// types are externally tagged enums over the two.
+
+impl StaticSchema for std::net::Ipv4Addr {
+    fn schema_node() -> SchemaNode {
+        <[u8; 4]>::schema_node()
+    }
+    #[inline]
+    fn columns() -> usize {
+        4
+    }
+}
+
+impl StaticSchema for std::net::Ipv6Addr {
+    fn schema_node() -> SchemaNode {
+        <[u8; 16]>::schema_node()
+    }
+    #[inline]
+    fn columns() -> usize {
+        16
+    }
+}
+
+impl StaticSchema for std::net::IpAddr {
+    fn schema_node() -> SchemaNode {
+        SchemaNode::Enum {
+            name: "IpAddr".to_owned(),
+            variants: vec![
+                (
+                    "V4".to_owned(),
+                    VariantNode::Newtype(Box::new(std::net::Ipv4Addr::schema_node())),
+                ),
+                (
+                    "V6".to_owned(),
+                    VariantNode::Newtype(Box::new(std::net::Ipv6Addr::schema_node())),
+                ),
+            ],
+        }
+    }
+    #[inline]
+    fn columns() -> usize {
+        1 + std::net::Ipv4Addr::columns() + std::net::Ipv6Addr::columns()
+    }
+}
+
+impl StaticSchema for std::net::SocketAddrV4 {
+    fn schema_node() -> SchemaNode {
+        <(std::net::Ipv4Addr, u16)>::schema_node()
+    }
+    #[inline]
+    fn columns() -> usize {
+        <(std::net::Ipv4Addr, u16)>::columns()
+    }
+}
+
+impl StaticSchema for std::net::SocketAddrV6 {
+    fn schema_node() -> SchemaNode {
+        <(std::net::Ipv6Addr, u16)>::schema_node()
+    }
+    #[inline]
+    fn columns() -> usize {
+        <(std::net::Ipv6Addr, u16)>::columns()
+    }
+}
+
+impl StaticSchema for std::net::SocketAddr {
+    fn schema_node() -> SchemaNode {
+        SchemaNode::Enum {
+            name: "SocketAddr".to_owned(),
+            variants: vec![
+                (
+                    "V4".to_owned(),
+                    VariantNode::Newtype(Box::new(std::net::SocketAddrV4::schema_node())),
+                ),
+                (
+                    "V6".to_owned(),
+                    VariantNode::Newtype(Box::new(std::net::SocketAddrV6::schema_node())),
+                ),
+            ],
+        }
+    }
+    #[inline]
+    fn columns() -> usize {
+        1 + std::net::SocketAddrV4::columns() + std::net::SocketAddrV6::columns()
+    }
+}
+
 impl StaticSchema for std::time::Duration {
     fn schema_node() -> SchemaNode {
         SchemaNode::Struct {
@@ -410,5 +587,20 @@ mod tests {
         assert_columns_agree::<PhantomData<u8>>();
         assert_columns_agree::<std::time::Duration>();
         assert_columns_agree::<std::time::SystemTime>();
+        assert_columns_agree::<[u8]>();
+        assert_columns_agree::<Box<[u16]>>();
+        assert_columns_agree::<Box<str>>();
+        assert_columns_agree::<std::path::Path>();
+        assert_columns_agree::<std::path::PathBuf>();
+        assert_columns_agree::<std::num::Wrapping<u32>>();
+        assert_columns_agree::<std::ops::Range<u8>>();
+        assert_columns_agree::<std::ops::RangeInclusive<String>>();
+        assert_columns_agree::<std::ops::Bound<u32>>();
+        assert_columns_agree::<std::net::Ipv4Addr>();
+        assert_columns_agree::<std::net::Ipv6Addr>();
+        assert_columns_agree::<std::net::IpAddr>();
+        assert_columns_agree::<std::net::SocketAddrV4>();
+        assert_columns_agree::<std::net::SocketAddrV6>();
+        assert_columns_agree::<std::net::SocketAddr>();
     }
 }

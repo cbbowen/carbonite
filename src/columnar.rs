@@ -531,7 +531,7 @@ impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for Option<T> {
     }
 }
 
-impl<T: SerializeColumns> SerializeColumns for Vec<T> {
+impl<T: SerializeColumns> SerializeColumns for [T] {
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         write_varint(&mut columns[0], self.len() as u64);
         let elems = &mut columns[1..];
@@ -543,6 +543,13 @@ impl<T: SerializeColumns> SerializeColumns for Vec<T> {
             item.serialize_columns(&mut *elems)?;
         }
         Ok(())
+    }
+}
+
+impl<T: SerializeColumns> SerializeColumns for Vec<T> {
+    #[inline]
+    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+        self.as_slice().serialize_columns(columns)
     }
 }
 
@@ -795,6 +802,283 @@ impl<T: SerializeColumns + ToOwned + ?Sized> SerializeColumns for Cow<'_, T> {
     #[inline]
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         self.as_ref().serialize_columns(columns)
+    }
+}
+
+impl<'de> DeserializeColumns<'de> for Box<str> {
+    #[inline]
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        Ok(String::deserialize_columns(cursors)?.into_boxed_str())
+    }
+}
+
+impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for Box<[T]> {
+    #[inline]
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        Ok(Vec::<T>::deserialize_columns(cursors)?.into_boxed_slice())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Paths, ranges, network addresses, numeric wrappers — each mirroring the
+// exact wire shape of std's serde impls, which the trace-equality tests in
+// `tests/std_types.rs` pin.
+// ---------------------------------------------------------------------------
+
+impl SerializeColumns for std::path::Path {
+    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+        match self.to_str() {
+            Some(s) => s.serialize_columns(columns),
+            // The message std's serde impl uses for the same failure.
+            None => Err(Error::Message(
+                "path contains invalid UTF-8 characters".to_owned(),
+            )),
+        }
+    }
+}
+
+impl SerializeColumns for std::path::PathBuf {
+    #[inline]
+    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+        self.as_path().serialize_columns(columns)
+    }
+}
+
+impl<'de> DeserializeColumns<'de> for std::path::PathBuf {
+    #[inline]
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        Ok(std::path::PathBuf::from(String::deserialize_columns(
+            cursors,
+        )?))
+    }
+}
+
+impl<'de: 'a, 'a> DeserializeColumns<'de> for &'a std::path::Path {
+    #[inline]
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        Ok(std::path::Path::new(<&str>::deserialize_columns(cursors)?))
+    }
+}
+
+impl<T: SerializeColumns> SerializeColumns for std::num::Wrapping<T> {
+    #[inline]
+    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+        self.0.serialize_columns(columns)
+    }
+}
+
+impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for std::num::Wrapping<T> {
+    #[inline]
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        Ok(std::num::Wrapping(T::deserialize_columns(cursors)?))
+    }
+}
+
+impl<T: SerializeColumns> SerializeColumns for std::ops::Range<T> {
+    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+        let mut rest = columns;
+        self.start
+            .serialize_columns(__split(&mut rest, T::columns()))?;
+        self.end.serialize_columns(rest)
+    }
+}
+
+impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for std::ops::Range<T> {
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        let mut rest = cursors;
+        let start = T::deserialize_columns(__split(&mut rest, T::columns()))?;
+        let end = T::deserialize_columns(rest)?;
+        Ok(start..end)
+    }
+}
+
+impl<T: SerializeColumns> SerializeColumns for std::ops::RangeInclusive<T> {
+    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+        let mut rest = columns;
+        self.start()
+            .serialize_columns(__split(&mut rest, T::columns()))?;
+        self.end().serialize_columns(rest)
+    }
+}
+
+impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for std::ops::RangeInclusive<T> {
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        let mut rest = cursors;
+        let start = T::deserialize_columns(__split(&mut rest, T::columns()))?;
+        let end = T::deserialize_columns(rest)?;
+        Ok(start..=end)
+    }
+}
+
+impl<T: SerializeColumns> SerializeColumns for std::ops::Bound<T> {
+    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+        match self {
+            std::ops::Bound::Unbounded => {
+                write_varint(&mut columns[0], 0);
+                Ok(())
+            }
+            std::ops::Bound::Included(value) => {
+                write_varint(&mut columns[0], 1);
+                value.serialize_columns(&mut columns[1..1 + T::columns()])
+            }
+            std::ops::Bound::Excluded(value) => {
+                write_varint(&mut columns[0], 2);
+                value.serialize_columns(&mut columns[1 + T::columns()..])
+            }
+        }
+    }
+}
+
+impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for std::ops::Bound<T> {
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        match cursors[0].varint()? {
+            0 => Ok(std::ops::Bound::Unbounded),
+            1 => Ok(std::ops::Bound::Included(T::deserialize_columns(
+                &mut cursors[1..1 + T::columns()],
+            )?)),
+            2 => Ok(std::ops::Bound::Excluded(T::deserialize_columns(
+                &mut cursors[1 + T::columns()..],
+            )?)),
+            tag => Err(__invalid_variant(tag)),
+        }
+    }
+}
+
+impl SerializeColumns for std::net::Ipv4Addr {
+    #[inline]
+    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+        self.octets().serialize_columns(columns)
+    }
+}
+
+impl<'de> DeserializeColumns<'de> for std::net::Ipv4Addr {
+    #[inline]
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        Ok(std::net::Ipv4Addr::from(<[u8; 4]>::deserialize_columns(
+            cursors,
+        )?))
+    }
+}
+
+impl SerializeColumns for std::net::Ipv6Addr {
+    #[inline]
+    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+        self.octets().serialize_columns(columns)
+    }
+}
+
+impl<'de> DeserializeColumns<'de> for std::net::Ipv6Addr {
+    #[inline]
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        Ok(std::net::Ipv6Addr::from(<[u8; 16]>::deserialize_columns(
+            cursors,
+        )?))
+    }
+}
+
+impl SerializeColumns for std::net::IpAddr {
+    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+        let v4 = std::net::Ipv4Addr::columns();
+        match self {
+            std::net::IpAddr::V4(addr) => {
+                write_varint(&mut columns[0], 0);
+                addr.serialize_columns(&mut columns[1..1 + v4])
+            }
+            std::net::IpAddr::V6(addr) => {
+                write_varint(&mut columns[0], 1);
+                addr.serialize_columns(&mut columns[1 + v4..])
+            }
+        }
+    }
+}
+
+impl<'de> DeserializeColumns<'de> for std::net::IpAddr {
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        let v4 = std::net::Ipv4Addr::columns();
+        match cursors[0].varint()? {
+            0 => Ok(std::net::IpAddr::V4(
+                std::net::Ipv4Addr::deserialize_columns(&mut cursors[1..1 + v4])?,
+            )),
+            1 => Ok(std::net::IpAddr::V6(
+                std::net::Ipv6Addr::deserialize_columns(&mut cursors[1 + v4..])?,
+            )),
+            tag => Err(__invalid_variant(tag)),
+        }
+    }
+}
+
+impl SerializeColumns for std::net::SocketAddrV4 {
+    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+        let mut rest = columns;
+        self.ip()
+            .serialize_columns(__split(&mut rest, std::net::Ipv4Addr::columns()))?;
+        self.port().serialize_columns(rest)
+    }
+}
+
+impl<'de> DeserializeColumns<'de> for std::net::SocketAddrV4 {
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        let mut rest = cursors;
+        let ip = std::net::Ipv4Addr::deserialize_columns(__split(
+            &mut rest,
+            std::net::Ipv4Addr::columns(),
+        ))?;
+        let port = u16::deserialize_columns(rest)?;
+        Ok(std::net::SocketAddrV4::new(ip, port))
+    }
+}
+
+impl SerializeColumns for std::net::SocketAddrV6 {
+    /// As in std's serde impl, only the address and port reach the wire;
+    /// `flowinfo` and `scope_id` are dropped.
+    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+        let mut rest = columns;
+        self.ip()
+            .serialize_columns(__split(&mut rest, std::net::Ipv6Addr::columns()))?;
+        self.port().serialize_columns(rest)
+    }
+}
+
+impl<'de> DeserializeColumns<'de> for std::net::SocketAddrV6 {
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        let mut rest = cursors;
+        let ip = std::net::Ipv6Addr::deserialize_columns(__split(
+            &mut rest,
+            std::net::Ipv6Addr::columns(),
+        ))?;
+        let port = u16::deserialize_columns(rest)?;
+        Ok(std::net::SocketAddrV6::new(ip, port, 0, 0))
+    }
+}
+
+impl SerializeColumns for std::net::SocketAddr {
+    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+        let v4 = std::net::SocketAddrV4::columns();
+        match self {
+            std::net::SocketAddr::V4(addr) => {
+                write_varint(&mut columns[0], 0);
+                addr.serialize_columns(&mut columns[1..1 + v4])
+            }
+            std::net::SocketAddr::V6(addr) => {
+                write_varint(&mut columns[0], 1);
+                addr.serialize_columns(&mut columns[1 + v4..])
+            }
+        }
+    }
+}
+
+impl<'de> DeserializeColumns<'de> for std::net::SocketAddr {
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        let v4 = std::net::SocketAddrV4::columns();
+        match cursors[0].varint()? {
+            0 => Ok(std::net::SocketAddr::V4(
+                std::net::SocketAddrV4::deserialize_columns(&mut cursors[1..1 + v4])?,
+            )),
+            1 => Ok(std::net::SocketAddr::V6(
+                std::net::SocketAddrV6::deserialize_columns(&mut cursors[1 + v4..])?,
+            )),
+            tag => Err(__invalid_variant(tag)),
+        }
     }
 }
 
