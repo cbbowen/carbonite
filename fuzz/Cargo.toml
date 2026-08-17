@@ -1,0 +1,36 @@
+[package]
+name = "carbonite-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde = { version = "1", features = ["derive"] }
+
+[dependencies.carbonite]
+path = ".."
+
+[[bin]]
+name = "from_slice"
+path = "fuzz_targets/from_slice.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "from_slice_columns"
+path = "fuzz_targets/from_slice_columns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "schema_from_bytes"
+path = "fuzz_targets/schema_from_bytes.rs"
+test = false
+doc = false
+bench = false

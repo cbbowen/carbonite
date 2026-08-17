@@ -144,13 +144,16 @@ scope would close the hazard outright, but the `Serialize` impl lacks a
 - [ ] **Split the derive** (1383 lines, one file) into attribute-parsing /
   schema-codegen / columnar-codegen modules; add trybuild UI tests locking in
   its error messages.
-- [ ] **Add a fuzz target** (`cargo-fuzz`) over `from_slice` +
-  `Schema::from_bytes` — the complement to the hand-written hardening tests;
-  it would likely have found item 2.
-- [ ] **Repo hygiene:** no CI config, no `LICENSE-MIT`/`LICENSE-APACHE` files
-  (the manifest declares them), no CHANGELOG. CI should run test/clippy/fmt on
-  stable + the 1.85 MSRV; `cargo-semver-checks` is cheap insurance given the
-  `#[doc(hidden)]`-but-public surface the derive depends on.
+- [x] **Add a fuzz target**: `fuzz/` (excluded from the workspace) carries
+  three libFuzzer targets — the serde-driven reader, the columnar reader, and
+  the schema decoder (which also asserts the decode/re-encode identity) —
+  over a kitchen-sink type touching every schema node kind. Run with
+  `cargo +nightly fuzz run <target>`.
+- [x] **Repo hygiene:** added `LICENSE-MIT`/`LICENSE-APACHE`, `CHANGELOG.md`
+  (Keep a Changelog form), and a CI workflow covering tests on
+  Linux/Windows across feature combinations, MSRV 1.85, fmt, clippy, and a
+  `--cfg docsrs` doc build. `cargo-semver-checks` is sketched in the workflow,
+  commented out until a version is on crates.io to serve as its baseline.
 
 ## 7. Compatibility contract
 

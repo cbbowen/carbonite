@@ -1,0 +1,47 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The wire format's own compatibility promises live with `SCHEMA_VERSION` and
+`FORMAT_VERSION` in the crate docs and are independent of the crate version.
+
+## [Unreleased]
+
+### Added
+
+- Fast-path (`StaticSchema` + columnar) coverage for `PathBuf`/`Path`, the
+  `IpAddr` and `SocketAddr` families, `Range`/`RangeInclusive`/`Bound`,
+  `Wrapping`, `[T]`, `Box<str>`, and `Box<[T]>`, so they work as derived-struct
+  fields without `#[carbonite(serde)]`.
+- Every engine (`Serializer`, `Deserializer`, `SelfDescribingSerializer`) now
+  accepts its schema either borrowed (`&schema`) or owned (`schema`).
+- A `shared` cargo feature (on by default) gating the `Shared`/`SharedArc`
+  wrapper API. Blobs holding shared columns still decode with the feature off
+  (repeats excepted).
+
+### Fixed
+
+- `compat::check` now exercises every variant of enums nested inside other
+  enums' variants; previously a removed nested variant could pass the check
+  while real data using it failed to read.
+- The columnar reader no longer sizes preallocations from a claimed count that
+  the input has only loosely justified: fixed-width elements are bounded by
+  their exact byte width, and other reservations are capped by a byte budget.
+- The columnar `Duration` reader now carries overflowing nanoseconds into the
+  seconds exactly as std's serde impl does, so the two engines agree on every
+  input.
+- `#[derive(Schema)]` rejects `#[serde(field_identifier)]` /
+  `#[serde(variant_identifier)]` at compile time instead of deriving a schema
+  that misdescribes the type.
+
+## [1.0.0]
+
+### Added
+
+- Initial release: schema-separated columnar serialization built on serde —
+  runtime schema tracing, `#[derive(Schema)]` compile-time schemas with
+  monomorphized columnar fast paths, self-describing framing, name-matched
+  schema evolution, `compat` checks for released schemas, `Shared`/`SharedArc`
+  identity-preserving wrappers, and the `glam` integration feature.

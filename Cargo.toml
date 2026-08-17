@@ -1,5 +1,8 @@
 [workspace]
 members = ["carbonite-derive"]
+# The fuzz crate builds with libFuzzer instrumentation under `cargo fuzz`,
+# so it stays outside the workspace's ordinary builds.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "1.0.0"
