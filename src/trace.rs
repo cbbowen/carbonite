@@ -61,6 +61,33 @@ fn untraceable(reason: impl Into<String>) -> Error {
     }
 }
 
+/// serde hands the format one entry per `#[serde(alias)]` alongside the real
+/// name, in a single flat list, with nothing marking which entry is which. The
+/// schema has to record the name the type *writes*, and that name cannot be
+/// picked out of the list, so an aliased type is untraceable rather than
+/// traceable-but-wrong.
+///
+/// `#[derive(Schema)]` reads the attributes directly and is unaffected, so it
+/// is the way to give such a type a schema.
+fn aliased_fields(name: &'static str) -> Error {
+    untraceable(format!(
+        "`{name}` has a field with #[serde(alias = \"...\")]. serde reports aliases and the real \
+         field name in one list, so tracing cannot tell which name the type writes. Put \
+         #[derive(carbonite::Schema)] on `{name}` and use StaticSchema::schema() instead of \
+         Schema::new()"
+    ))
+}
+
+/// The variant-level counterpart of [`aliased_fields`].
+fn aliased_variants(name: &'static str) -> Error {
+    untraceable(format!(
+        "`{name}` has a variant with #[serde(alias = \"...\")]. serde reports aliases and the real \
+         variant name in one list, so tracing cannot tell which name the type writes. Put \
+         #[derive(carbonite::Schema)] on `{name}` and use StaticSchema::schema() instead of \
+         Schema::new()"
+    ))
+}
+
 /// Wraps errors raised *by the type* (e.g. validation of synthetic values)
 /// so the failure mode is clear.
 fn annotate(err: Error) -> Error {
@@ -649,13 +676,19 @@ impl<'de> de::Deserializer<'de> for Tracer<'_, '_> {
             _ => Priors::None,
         };
         let mut nodes = Vec::with_capacity(fields.len());
-        let value = visitor.visit_map(TraceStruct {
-            fields,
-            nodes: &mut nodes,
-            priors,
-            pending: false,
-            depth,
-        })?;
+        // A key the visitor accepts but then refuses to take a value for is a
+        // duplicate field, which is how `#[serde(alias)]` surfaces here; see
+        // `aliased_fields`.
+        let mut pending = false;
+        let value = visitor
+            .visit_map(TraceStruct {
+                fields,
+                nodes: &mut nodes,
+                priors,
+                pending: &mut pending,
+                depth,
+            })
+            .map_err(|e| if pending { aliased_fields(name) } else { e })?;
         if nodes.len() != fields.len() {
             return Err(untraceable("a struct visitor did not read every field"));
         }
@@ -676,12 +709,20 @@ impl<'de> de::Deserializer<'de> for Tracer<'_, '_> {
         let chosen = choose_variant(self.prior, variants.len());
         let variant_prior = prior_variant(self.prior, chosen);
         let mut shape = None;
-        let value = visitor.visit_enum(TraceEnum {
-            index: chosen,
-            shape: &mut shape,
-            prior: variant_prior,
-            depth,
-        })?;
+        // A variant index the visitor rejects means the list serde handed us
+        // is longer than the enum really is, which is how variant aliases
+        // surface here; see `aliased_variants`.
+        let mut rejected = false;
+        let value = visitor
+            .visit_enum(TraceEnum {
+                name,
+                index: chosen,
+                shape: &mut shape,
+                prior: variant_prior,
+                rejected: &mut rejected,
+                depth,
+            })
+            .map_err(|e| if rejected { aliased_variants(name) } else { e })?;
         if shape.is_none() {
             return Err(untraceable("an enum visitor did not inspect its variant"));
         }
@@ -747,7 +788,10 @@ struct TraceStruct<'a, 'p> {
     fields: &'static [&'static str],
     nodes: &'a mut Vec<TNode>,
     priors: Priors<'p>,
-    pending: bool,
+    /// Set while a key has been handed over but its value not yet requested.
+    /// Borrowed so `deserialize_struct` can tell an aliased field apart from
+    /// an ordinary failure — see `aliased_fields`.
+    pending: &'a mut bool,
     depth: usize,
 }
 
@@ -755,25 +799,25 @@ impl<'de> MapAccess<'de> for TraceStruct<'_, '_> {
     type Error = Error;
 
     fn next_key_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<Option<S::Value>> {
-        if self.pending {
+        if *self.pending {
             return Err(untraceable("a struct visitor requested two keys in a row"));
         }
         let index = self.nodes.len();
         if index >= self.fields.len() {
             return Ok(None);
         }
-        self.pending = true;
+        *self.pending = true;
         seed.deserialize(key_deserializer(self.fields[index]))
             .map(Some)
     }
 
     fn next_value_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<S::Value> {
-        if !self.pending {
+        if !*self.pending {
             return Err(untraceable(
                 "a struct visitor requested a value without a key",
             ));
         }
-        self.pending = false;
+        *self.pending = false;
         let index = self.nodes.len();
         let (value, node) = subtrace(seed, self.priors.get(index), self.depth)?;
         self.nodes.push(node);
@@ -829,9 +873,14 @@ impl<'de> MapAccess<'de> for TraceMap<'_, '_> {
 
 /// Steers an enum visitor to the chosen variant and records its shape.
 struct TraceEnum<'a, 'p> {
+    /// The enum's own name, for error messages raised inside a variant.
+    name: &'static str,
     index: usize,
     shape: &'a mut Option<TVariant>,
     prior: Option<&'p TVariant>,
+    /// Set when the visitor refuses the variant index we steered it to.
+    /// Borrowed so `deserialize_enum` can report aliases specifically.
+    rejected: &'a mut bool,
     depth: usize,
 }
 
@@ -840,10 +889,15 @@ impl<'de> EnumAccess<'de> for TraceEnum<'_, '_> {
     type Variant = Self;
 
     fn variant_seed<S: DeserializeSeed<'de>>(self, seed: S) -> Result<(S::Value, Self::Variant)> {
-        let value = seed.deserialize(VariantIndexDeserializer {
+        match seed.deserialize(VariantIndexDeserializer {
             index: self.index as u64,
-        })?;
-        Ok((value, self))
+        }) {
+            Ok(value) => Ok((value, self)),
+            Err(e) => {
+                *self.rejected = true;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -896,13 +950,17 @@ impl<'de> VariantAccess<'de> for TraceEnum<'_, '_> {
             _ => Priors::None,
         };
         let mut nodes = Vec::with_capacity(fields.len());
-        let value = visitor.visit_map(TraceStruct {
-            fields,
-            nodes: &mut nodes,
-            priors,
-            pending: false,
-            depth: self.depth,
-        })?;
+        let mut pending = false;
+        let name = self.name;
+        let value = visitor
+            .visit_map(TraceStruct {
+                fields,
+                nodes: &mut nodes,
+                priors,
+                pending: &mut pending,
+                depth: self.depth,
+            })
+            .map_err(|e| if pending { aliased_fields(name) } else { e })?;
         if nodes.len() != fields.len() {
             return Err(untraceable(
                 "a struct variant visitor did not read every field",
@@ -1091,5 +1149,64 @@ mod tests {
         }
 
         assert!(matches!(trace::<Node>(), Err(Error::DepthLimitExceeded)));
+    }
+
+    /// serde reports a field's aliases and its real name in one flat list, so
+    /// the name the type *writes* cannot be picked out. The failure has to say
+    /// so and name the way out, rather than surfacing serde's own
+    /// `duplicate field` from deep inside the trace.
+    #[test]
+    fn rejects_aliased_fields_with_an_actionable_error() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Renamed {
+            #[serde(alias = "name")]
+            title: String,
+        }
+
+        let Err(Error::Untraceable { reason }) = trace::<Renamed>() else {
+            panic!("expected an Untraceable error");
+        };
+        assert!(reason.contains("Renamed"), "{reason}");
+        assert!(reason.contains("alias"), "{reason}");
+        assert!(reason.contains("derive"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_aliased_variants_with_an_actionable_error() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        enum Weapon {
+            Sword,
+            #[serde(alias = "Crossbow")]
+            Bow {
+                range: u32,
+            },
+        }
+
+        let Err(Error::Untraceable { reason }) = trace::<Weapon>() else {
+            panic!("expected an Untraceable error");
+        };
+        assert!(reason.contains("Weapon"), "{reason}");
+        assert!(reason.contains("alias"), "{reason}");
+    }
+
+    /// A field inside a struct variant, which traces through a different path.
+    #[test]
+    fn rejects_aliased_fields_inside_a_variant() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        enum Action {
+            Apply {
+                #[serde(alias = "0")]
+                id: u32,
+            },
+        }
+
+        let Err(Error::Untraceable { reason }) = trace::<Action>() else {
+            panic!("expected an Untraceable error");
+        };
+        assert!(reason.contains("Action"), "{reason}");
+        assert!(reason.contains("alias"), "{reason}");
     }
 }

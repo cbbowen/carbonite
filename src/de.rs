@@ -8,6 +8,14 @@
 //! unknown fields are ignored (their columns are skipped), missing fields use
 //! `#[serde(default)]` or report `missing field`, and `#[serde(alias)]`
 //! works.
+//!
+//! A file whose fields are *positional* (a tuple, tuple struct, or tuple
+//! variant) can also be read into named fields, but only when the reader says
+//! which position each field replaces, with `#[serde(alias = "0")]`. Matching
+//! it by declaration order instead would not compose with reordering named
+//! fields, which is already a no-op; see [`positional_names`] and
+//! [`needs_positional_names`]. The reverse — a named file read into a tuple —
+//! is refused, since a tuple has nowhere to make that declaration.
 
 use std::fmt;
 use std::iter::FusedIterator;
@@ -378,6 +386,140 @@ fn key_deserializer(key: &str) -> StrDeserializer<'_, Error> {
     StrDeserializer::new(key)
 }
 
+/// Whether the reading type tags any of its fields with one of the writer's
+/// positions `"0"`..`"count-1"`, which is how it opts into index matching for a
+/// payload the writer recorded positionally.
+///
+/// serde puts `#[serde(alias = "...")]` values in the field list it hands the
+/// format, alongside the real names, so a reader that tags its fields with the
+/// tuple positions they came from is visible here:
+///
+/// ```text
+/// enum Action {
+///     Apply {
+///         #[serde(alias = "1")] y: u32,
+///         #[serde(alias = "0")] x: u32,
+///     },
+/// }
+/// ```
+///
+/// One tag is enough to opt in. carbonite then drives the reader over every
+/// position the writer stored and lets serde do the matching, so a position
+/// the reader left untagged matches nothing: it is reported as a missing field
+/// rather than filled from whatever happened to line up. That is also what
+/// lets a reader *drop* a position, by no longer naming it.
+///
+/// The list interleaves aliases with real names and cannot be split back up
+/// per field, which is why this only looks for the tags rather than pairing
+/// them with fields itself.
+fn positional_names(fields: &[&str], count: usize) -> bool {
+    /// `s == n`, rendered as decimal, without allocating.
+    fn is_index(s: &str, n: usize) -> bool {
+        let mut buf = [0u8; 20];
+        let mut len = 0;
+        let mut value = n;
+        loop {
+            len += 1;
+            buf[buf.len() - len] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        s.as_bytes() == &buf[buf.len() - len..]
+    }
+
+    (0..count).any(|i| fields.iter().any(|field| is_index(field, i)))
+}
+
+/// A positional payload reaching named fields that have not said which
+/// position each one replaces.
+///
+/// Reading it in declaration order would be an evolution step that does not
+/// compose: reordering named fields is already a no-op, so `A(f32, f32)` ->
+/// `B { x, y }` followed by `B { x, y }` -> `C { y, x }` would make a blob
+/// written as `A` decode into `C` with its values swapped, silently. Requiring
+/// the positions to be declared makes the correspondence survive any later
+/// reordering.
+fn needs_positional_names(count: usize) -> Error {
+    let aliases = (0..count)
+        .map(|i| format!("#[serde(alias = \"{i}\")]"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Error::SchemaMismatch {
+        expected: format!(
+            "named fields tagged with the positions they replace ({aliases}), since the writer \
+             recorded positions and no names"
+        ),
+        found: "named fields without them; matching by declaration order would silently change \
+                meaning if those fields are ever reordered"
+            .to_owned(),
+    }
+}
+
+/// The mirror image: a named payload reaching a tuple, which fails to compose
+/// for the same reason and cannot be rescued, because a tuple has nowhere to
+/// put the declaration.
+fn named_into_positional() -> Error {
+    Error::SchemaMismatch {
+        expected: "a reader with named fields, matched by name".to_owned(),
+        found: "a tuple, which has nowhere to declare which of the writer's named fields each \
+                position holds"
+            .to_owned(),
+    }
+}
+
+/// Reads a positional payload as a map keyed by field index. The counterpart
+/// of [`visit_product`] for readers that declared their positions via
+/// [`positional_names`];
+/// unlike that one it needs no drain, because the visitor is driven over every
+/// one of the writer's fields and ignores the ones it does not know.
+fn visit_numbered<'s, 'de, V: Visitor<'de>>(
+    fields: FieldList<'s>,
+    lfields: &'s [LNode],
+    cursors: &mut [Cursor<'de>],
+    fast: bool,
+    visitor: V,
+) -> Result<V::Value> {
+    visitor.visit_map(NumberedMap {
+        fields,
+        lfields,
+        cursors,
+        index: 0,
+        fast,
+    })
+}
+
+/// Reads a product of fields positionally, then advances past any the visitor
+/// did not ask for.
+///
+/// A reader whose type has fewer fields than the writer's stops pulling early
+/// — a shortened tuple, or a struct reading a wider positional payload. The
+/// leftover fields still own columns in this row, so they are skipped here;
+/// otherwise the row is left partly unread and the blob reports trailing
+/// bytes.
+fn visit_product<'s, 'de, V: Visitor<'de>>(
+    fields: FieldList<'s>,
+    lfields: &'s [LNode],
+    cursors: &mut [Cursor<'de>],
+    fast: bool,
+    visitor: V,
+) -> Result<V::Value> {
+    let mut index = 0usize;
+    let value = visitor.visit_seq(FieldsSeq {
+        fields,
+        lfields,
+        cursors: &mut *cursors,
+        index: &mut index,
+        fast,
+    })?;
+    while let Some((node, lnode)) = fields.get(index).zip(lfields.get(index)) {
+        ValueDeserializer::skip(node, lnode, cursors)?;
+        index += 1;
+    }
+    Ok(value)
+}
+
 /// Reads one value out of `cursors` (exactly the columns of `node`, in layout
 /// order) through the schema-driven serde path.
 ///
@@ -503,22 +645,16 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                     fast: self.fast,
                 })
             }
-            (SchemaNode::Tuple(fields), LNode::Product(lfields)) => visitor.visit_seq(FieldsSeq {
-                fields: FieldList::Plain(fields),
+            (
+                SchemaNode::Tuple(fields) | SchemaNode::TupleStruct { fields, .. },
+                LNode::Product(lfields),
+            ) => visit_product(
+                FieldList::Plain(fields),
                 lfields,
-                cursors: self.cursors,
-                index: 0,
-                fast: self.fast,
-            }),
-            (SchemaNode::TupleStruct { fields, .. }, LNode::Product(lfields)) => {
-                visitor.visit_seq(FieldsSeq {
-                    fields: FieldList::Plain(fields),
-                    lfields,
-                    cursors: self.cursors,
-                    index: 0,
-                    fast: self.fast,
-                })
-            }
+                self.cursors,
+                self.fast,
+                visitor,
+            ),
             (
                 SchemaNode::Map { key, value },
                 LNode::Map {
@@ -544,13 +680,13 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
             }
             (SchemaNode::Struct { fields, .. }, LNode::Product(lfields)) => {
                 if self.fast {
-                    visitor.visit_seq(FieldsSeq {
-                        fields: FieldList::Named(fields),
+                    visit_product(
+                        FieldList::Named(fields),
                         lfields,
-                        cursors: self.cursors,
-                        index: 0,
-                        fast: self.fast,
-                    })
+                        self.cursors,
+                        self.fast,
+                        visitor,
+                    )
                 } else {
                     visitor.visit_map(StructMap {
                         fields,
@@ -608,6 +744,47 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                 }
             }
             _ => unreachable!("layout was built from this schema"),
+        }
+    }
+
+    /// This value's fields, if the writer's shape is a product (a newtype
+    /// struct, tuple, tuple struct, or struct). Every product shape is a list
+    /// of fields in declaration order, which is what lets one replace another
+    /// between versions.
+    fn product_fields(&self) -> Option<(FieldList<'s>, &'s [LNode])> {
+        match (self.node, self.lnode) {
+            (SchemaNode::NewtypeStruct { inner, .. }, LNode::Newtype(linner)) => Some((
+                FieldList::Plain(std::slice::from_ref(&**inner)),
+                std::slice::from_ref(&**linner),
+            )),
+            (
+                SchemaNode::Tuple(fields) | SchemaNode::TupleStruct { fields, .. },
+                LNode::Product(lfields),
+            ) => Some((FieldList::Plain(fields), lfields)),
+            (SchemaNode::Struct { fields, .. }, LNode::Product(lfields)) => {
+                Some((FieldList::Named(fields), lfields))
+            }
+            _ => None,
+        }
+    }
+
+    fn visit_product<V: Visitor<'de>>(
+        self,
+        fields: FieldList<'s>,
+        lfields: &'s [LNode],
+        visitor: V,
+    ) -> Result<V::Value> {
+        visit_product(fields, lfields, self.cursors, self.fast, visitor)
+    }
+
+    /// Reads any product shape positionally, for a reader asking for a tuple,
+    /// tuple struct, or newtype struct. A writer that recorded names is
+    /// refused; see [`named_into_positional`].
+    fn deserialize_positional<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        match self.product_fields() {
+            Some((FieldList::Named(_), _)) if !self.fast => Err(named_into_positional()),
+            Some((fields, lfields)) => self.visit_product(fields, lfields, visitor),
+            None => self.dispatch(visitor),
         }
     }
 
@@ -827,13 +1004,54 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
         if name == crate::shared::SHARED_TOKEN {
             return self.deserialize_shared_wrapper(visitor);
         }
-        self.dispatch(visitor)
+        match self.node {
+            // Same shape: hand it over as a newtype, exactly as before.
+            SchemaNode::NewtypeStruct { .. } => self.dispatch(visitor),
+            _ => self.deserialize_positional(visitor),
+        }
+    }
+
+    /// The reader wants named fields. A writer that had them too goes through
+    /// `dispatch` (name matching); a positional writer is reconciled by
+    /// [`positional_names`] — by index if the reader declared the positions,
+    /// otherwise in order.
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value> {
+        match self.product_fields() {
+            // The writer recorded names; `dispatch` matches on them.
+            Some((FieldList::Named(_), _)) | None => self.dispatch(visitor),
+            Some((positional, lfields)) => {
+                if positional_names(fields, positional.len()) {
+                    visit_numbered(positional, lfields, self.cursors, self.fast, visitor)
+                } else {
+                    Err(needs_positional_names(positional.len()))
+                }
+            }
+        }
+    }
+
+    /// The reader wants positional fields. A writer that recorded names still
+    /// has them in declaration order, so hand them over positionally.
+    fn deserialize_tuple<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value> {
+        self.deserialize_positional(visitor)
+    }
+
+    fn deserialize_tuple_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value> {
+        self.deserialize_positional(visitor)
     }
 
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf unit unit_struct seq tuple tuple_struct
-        map struct enum identifier
+        bytes byte_buf unit unit_struct seq map enum identifier
     }
 
     fn is_human_readable(&self) -> bool {
@@ -876,6 +1094,7 @@ impl<'de> SeqAccess<'de> for ColSeq<'_, '_, 'de> {
     }
 }
 
+#[derive(Clone, Copy)]
 enum FieldList<'s> {
     Plain(&'s [SchemaNode]),
     Named(&'s [(String, SchemaNode)]),
@@ -898,11 +1117,16 @@ impl<'s> FieldList<'s> {
 }
 
 /// Positional fields: tuples, tuple structs/variants, and fast-path structs.
+///
+/// `index` is borrowed rather than owned so the caller can see how far the
+/// visitor got: a reader with fewer fields than the writer stops early, and
+/// the fields it never asked for still have to be skipped (see
+/// [`ValueDeserializer::visit_product`]).
 struct FieldsSeq<'s, 'c, 'de> {
     fields: FieldList<'s>,
     lfields: &'s [LNode],
     cursors: &'c mut [Cursor<'de>],
-    index: usize,
+    index: &'c mut usize,
     fast: bool,
 }
 
@@ -912,12 +1136,12 @@ impl<'de> SeqAccess<'de> for FieldsSeq<'_, '_, 'de> {
     fn next_element_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<Option<S::Value>> {
         let Some((node, lnode)) = self
             .fields
-            .get(self.index)
-            .zip(self.lfields.get(self.index))
+            .get(*self.index)
+            .zip(self.lfields.get(*self.index))
         else {
             return Ok(None);
         };
-        self.index += 1;
+        *self.index += 1;
         seed.deserialize(ValueDeserializer {
             node,
             lnode,
@@ -928,7 +1152,7 @@ impl<'de> SeqAccess<'de> for FieldsSeq<'_, '_, 'de> {
     }
 
     fn size_hint(&self) -> Option<usize> {
-        Some(self.fields.len() - self.index)
+        Some(self.fields.len() - *self.index)
     }
 }
 
@@ -957,6 +1181,47 @@ impl<'de> MapAccess<'de> for StructMap<'_, '_, 'de> {
             .fields
             .get(self.index)
             .map(|(_, field)| field)
+            .zip(self.lfields.get(self.index))
+            .expect("next_value_seed called after next_key_seed returned a key");
+        self.index += 1;
+        seed.deserialize(ValueDeserializer {
+            node,
+            lnode,
+            cursors: self.cursors,
+            fast: self.fast,
+        })
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.fields.len() - self.index)
+    }
+}
+
+/// A positional payload presented as a map keyed by field index. See
+/// [`positional_names`].
+struct NumberedMap<'s, 'c, 'de> {
+    fields: FieldList<'s>,
+    lfields: &'s [LNode],
+    cursors: &'c mut [Cursor<'de>],
+    index: usize,
+    fast: bool,
+}
+
+impl<'de> MapAccess<'de> for NumberedMap<'_, '_, 'de> {
+    type Error = Error;
+
+    fn next_key_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<Option<S::Value>> {
+        if self.index >= self.fields.len() {
+            return Ok(None);
+        }
+        let key = self.index.to_string();
+        seed.deserialize(key_deserializer(&key)).map(Some)
+    }
+
+    fn next_value_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<S::Value> {
+        let (node, lnode) = self
+            .fields
+            .get(self.index)
             .zip(self.lfields.get(self.index))
             .expect("next_value_seed called after next_key_seed returned a key");
         self.index += 1;
@@ -1053,33 +1318,34 @@ impl<'de> VariantAccess<'de> for ColEnum<'_, '_, 'de> {
     }
 
     fn newtype_variant_seed<S: DeserializeSeed<'de>>(self, seed: S) -> Result<S::Value> {
-        match (self.shape, self.lnode) {
-            (VariantNode::Newtype(inner), LNode::Newtype(linner)) => {
+        // A newtype variant is a one-field product, so any positional writer
+        // shape holding exactly one field reads into it.
+        match self.payload_fields() {
+            Some((FieldList::Named(_), _)) if !self.fast => Err(named_into_positional()),
+            Some((fields, lfields)) if fields.len() == 1 => {
+                let node = fields.get(0).expect("len checked");
                 seed.deserialize(ValueDeserializer {
-                    node: inner,
-                    lnode: linner,
-                    cursors: self.cursors,
+                    node,
+                    lnode: &lfields[0],
                     fast: self.fast,
+                    cursors: self.cursors,
                 })
             }
-            (other, _) => Err(Error::SchemaMismatch {
-                expected: variant_shape_name(other).to_owned(),
+            _ => Err(Error::SchemaMismatch {
+                expected: variant_shape_name(self.shape).to_owned(),
                 found: format!("newtype variant `{}`", self.name),
             }),
         }
     }
 
     fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value> {
-        match (self.shape, self.lnode) {
-            (VariantNode::Tuple(fields), LNode::Product(lfields)) => visitor.visit_seq(FieldsSeq {
-                fields: FieldList::Plain(fields),
-                lfields,
-                cursors: self.cursors,
-                index: 0,
-                fast: self.fast,
-            }),
-            (other, _) => Err(Error::SchemaMismatch {
-                expected: variant_shape_name(other).to_owned(),
+        match self.payload_fields() {
+            Some((FieldList::Named(_), _)) if !self.fast => Err(named_into_positional()),
+            Some((fields, lfields)) => {
+                visit_product(fields, lfields, self.cursors, self.fast, visitor)
+            }
+            None => Err(Error::SchemaMismatch {
+                expected: variant_shape_name(self.shape).to_owned(),
                 found: format!("tuple variant `{}`", self.name),
             }),
         }
@@ -1087,33 +1353,66 @@ impl<'de> VariantAccess<'de> for ColEnum<'_, '_, 'de> {
 
     fn struct_variant<V: Visitor<'de>>(
         self,
-        _fields: &'static [&'static str],
+        fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value> {
         match (self.shape, self.lnode) {
-            (VariantNode::Struct(fields), LNode::Product(lfields)) => {
-                if self.fast {
-                    visitor.visit_seq(FieldsSeq {
-                        fields: FieldList::Named(fields),
-                        lfields,
-                        cursors: self.cursors,
-                        index: 0,
-                        fast: self.fast,
-                    })
-                } else {
-                    visitor.visit_map(StructMap {
-                        fields,
-                        lfields,
-                        cursors: self.cursors,
-                        index: 0,
-                        fast: self.fast,
-                    })
+            // The writer had named fields too: match by name, which is what
+            // makes reordering and `#[serde(alias)]` work.
+            (VariantNode::Struct(wfields), LNode::Product(lfields)) if !self.fast => visitor
+                .visit_map(StructMap {
+                    fields: wfields,
+                    lfields,
+                    cursors: self.cursors,
+                    index: 0,
+                    fast: self.fast,
+                }),
+            // Otherwise the writer's payload was positional (or this is the
+            // fast path, where positions already agree); see
+            // [`positional_names`].
+            _ => match self.payload_fields() {
+                // On the fast path the shapes are identical, so positions
+                // already agree and no declaration is needed.
+                Some((payload, lfields)) if self.fast => {
+                    visit_product(payload, lfields, self.cursors, self.fast, visitor)
                 }
+                Some((payload, lfields)) => {
+                    if positional_names(fields, payload.len()) {
+                        visit_numbered(payload, lfields, self.cursors, self.fast, visitor)
+                    } else {
+                        Err(needs_positional_names(payload.len()))
+                    }
+                }
+                None => Err(Error::SchemaMismatch {
+                    expected: variant_shape_name(self.shape).to_owned(),
+                    found: format!("struct variant `{}`", self.name),
+                }),
+            },
+        }
+    }
+}
+
+impl<'s> ColEnum<'s, '_, '_> {
+    /// The variant's payload as a positional field list, whatever shape the
+    /// writer used. Every non-unit variant shape is a product of fields, so
+    /// this is what lets a variant change shape between versions: a newtype,
+    /// tuple, or struct payload all present the same way to a reader that
+    /// asks for a different one. `None` for a unit variant, which has no
+    /// fields to offer.
+    fn payload_fields(&self) -> Option<(FieldList<'s>, &'s [LNode])> {
+        match (self.shape, self.lnode) {
+            (VariantNode::Unit, _) => None,
+            (VariantNode::Newtype(inner), LNode::Newtype(linner)) => Some((
+                FieldList::Plain(std::slice::from_ref(&**inner)),
+                std::slice::from_ref(&**linner),
+            )),
+            (VariantNode::Tuple(fields), LNode::Product(lfields)) => {
+                Some((FieldList::Plain(fields), lfields))
             }
-            (other, _) => Err(Error::SchemaMismatch {
-                expected: variant_shape_name(other).to_owned(),
-                found: format!("struct variant `{}`", self.name),
-            }),
+            (VariantNode::Struct(fields), LNode::Product(lfields)) => {
+                Some((FieldList::Named(fields), lfields))
+            }
+            _ => unreachable!("layout was built from this schema"),
         }
     }
 }
