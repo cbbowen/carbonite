@@ -431,6 +431,13 @@ assert!(Shared::ptr_eq(&back[0].mesh, &back[99].mesh));
 In any other serde format the wrappers are invisible and duplicate inline, exactly like a
 plain `Rc`.
 
+The wrappers live behind the `shared` feature (on by default; a build that opts out can
+still read blobs whose schema has shared columns, repeats excepted). One caveat: uniqueness
+within a row is decided by the pointee's *address*, so every handle serialized in a row must
+be alive at the same time. Handles stored in the value always are; temporary wrappers
+manufactured inside a hand-written `Serialize` impl are not, and a reused allocation would
+silently alias two objects — serialize handles that live in the data.
+
 ## How it works
 
 Every type maps onto the serde data model, and every leaf gets a column: fixed-width

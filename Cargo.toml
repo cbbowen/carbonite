@@ -23,9 +23,16 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-default = ["derive"]
+default = ["derive", "shared"]
 # Re-exports `#[derive(Schema)]`, the compile-time schema fast path.
 derive = ["dep:carbonite-derive"]
+# The `Shared`/`SharedArc` wrappers, which write each unique Rc/Arc object
+# once per row and rebuild pointer sharing on read. Write-side identity is the
+# pointee's address, which carries a caveat for hand-written Serialize impls
+# (see the type docs); the flag lets a build that doesn't need the wrappers
+# opt out of the API and its caveat entirely. The wire format is unaffected:
+# blobs containing shared columns still decode (repeats excepted) either way.
+shared = []
 # Compile-time schemas and columnar fast paths for `glam`'s math types, which
 # the orphan rule puts out of reach for glam's own users. Turns on glam's
 # `serde` and `all-types` features so every implemented type is present.

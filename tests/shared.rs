@@ -1,6 +1,6 @@
 //! Shared-structure preservation: `Shared` / `SharedArc` deduplicate per row
 //! and reconstruct pointer identity on read.
-#![cfg(feature = "derive")]
+#![cfg(all(feature = "derive", feature = "shared"))]
 
 use serde::{Deserialize, Serialize};
 

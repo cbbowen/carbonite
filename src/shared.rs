@@ -25,34 +25,64 @@
 //!   makes most real strong topologies DAGs.
 //! - Reconstructing sharing requires `T: 'static` (plus `Send + Sync` for
 //!   [`SharedArc`]) because the read registry is type-erased.
+//! - **Write-side identity is the pointee's address**, so every handle
+//!   serialized within one row must be alive at the same time. That is
+//!   automatically true for handles reachable from the value being
+//!   serialized — which is every handle a derived `Serialize` impl can
+//!   produce. A *hand-written* `Serialize` impl that manufactures temporary
+//!   wrappers mid-row (`serialize_element(&Shared::new(...))` in a loop,
+//!   dropping each before the next) breaks the assumption: the allocator may
+//!   reuse a dropped pointee's address, and the new object would be silently
+//!   deduplicated against the old one's dictionary entry. Serialize handles
+//!   that live in the data, not handles conjured during serialization.
+//!
+//! The wrapper types and their impls sit behind the **`shared`** cargo
+//! feature (on by default). The protocol machinery below stays unconditional,
+//! because a blob written *with* shared columns must still decode in a build
+//! without them: first occurrences materialize transparently and skipped
+//! fields skip correctly; only repeats need the wrappers.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::marker::PhantomData;
-use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use serde::de::Visitor;
-use serde::{Deserialize, Serialize};
-
-use crate::columnar::{ColumnCursor, DeserializeColumns, SerializeColumns, write_varint};
 use crate::error::{Error, Result};
-use crate::schema::SchemaNode;
-use crate::static_schema::StaticSchema;
 
 /// The sentinel newtype-struct name that lets carbonite's format recognize
 /// shared wrappers through serde's data model.
 pub(crate) const SHARED_TOKEN: &str = "$carbonite::Shared";
 
 // ---------------------------------------------------------------------------
-// The wrappers.
+// The wrappers: the `shared` feature's public API. Everything below the module
+// is the dictionary protocol itself, which stays unconditional so a blob
+// holding shared columns still decodes (repeats excepted) with the feature
+// off.
 // ---------------------------------------------------------------------------
 
-macro_rules! shared_wrapper {
+#[cfg(feature = "shared")]
+pub use wrappers::{Shared, SharedArc};
+
+#[cfg(feature = "shared")]
+mod wrappers {
+    use std::fmt;
+    use std::hash::{Hash, Hasher};
+    use std::marker::PhantomData;
+    use std::ops::Deref;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    use serde::de::Visitor;
+    use serde::{Deserialize, Serialize};
+
+    use super::{Erased, ReadSlot, SHARED_TOKEN, WriteKey, fulfill, read_slot, write_key};
+    use crate::columnar::{ColumnCursor, DeserializeColumns, SerializeColumns, write_varint};
+    use crate::error::{Error, Result};
+    use crate::schema::SchemaNode;
+    use crate::static_schema::StaticSchema;
+
+    macro_rules! shared_wrapper {
     ($(#[$doc:meta])* $name:ident, $ptr:ident, $ptr_path:path) => {
         $(#[$doc])*
         pub struct $name<T>($ptr<T>);
@@ -164,175 +194,215 @@ macro_rules! shared_wrapper {
     };
 }
 
-shared_wrapper! {
-    /// A shared, per-row-deduplicated value backed by [`Rc`].
-    ///
-    /// Serializes each unique object once per row; deserialization
-    /// reconstructs the sharing ([`Shared::ptr_eq`] holds after a round
-    /// trip). In non-carbonite serde formats the wrapper is invisible and
-    /// duplicates inline. See the [crate-level notes](crate#shared-values).
-    Shared, Rc, std::rc::Rc
-}
+    shared_wrapper! {
+        /// A shared, per-row-deduplicated value backed by [`Rc`].
+        ///
+        /// Serializes each unique object once per row; deserialization
+        /// reconstructs the sharing ([`Shared::ptr_eq`] holds after a round
+        /// trip). In non-carbonite serde formats the wrapper is invisible and
+        /// duplicates inline. See the [crate-level notes](crate#shared-values).
+        ///
+        /// # Handles must be alive together
+        ///
+        /// Uniqueness within a row is decided by the pointee's *address*, so
+        /// every handle serialized in one row must be alive at the same time —
+        /// which handles stored in the value always are. Do not manufacture
+        /// temporary `Shared` values inside a hand-written `Serialize` impl:
+        /// a dropped temporary's address can be reused by the next one, silently
+        /// aliasing two distinct objects.
+        Shared, Rc, std::rc::Rc
+    }
 
-shared_wrapper! {
-    /// The [`Arc`]-backed sibling of [`Shared`]. The two share a wire
-    /// representation, so a blob written with one can be read with the
-    /// other.
-    SharedArc, Arc, std::sync::Arc
-}
+    shared_wrapper! {
+        /// The [`Arc`]-backed sibling of [`Shared`]. The two share a wire
+        /// representation, so a blob written with one can be read with the
+        /// other.
+        ///
+        /// The [aliveness caveat](Shared#handles-must-be-alive-together) applies
+        /// identically: uniqueness is decided by the pointee's address, so never
+        /// serialize temporary `SharedArc` values manufactured mid-row.
+        SharedArc, Arc, std::sync::Arc
+    }
 
-impl<'de, T: Deserialize<'de> + 'static> Deserialize<'de> for Shared<T> {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct SharedVisitor<T>(PhantomData<T>);
+    impl<'de, T: Deserialize<'de> + 'static> Deserialize<'de> for Shared<T> {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct SharedVisitor<T>(PhantomData<T>);
 
-        impl<'de, T: Deserialize<'de> + 'static> Visitor<'de> for SharedVisitor<T> {
-            type Value = Shared<T>;
+            impl<'de, T: Deserialize<'de> + 'static> Visitor<'de> for SharedVisitor<T> {
+                type Value = Shared<T>;
 
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a shared value")
-            }
-
-            fn visit_newtype_struct<D: serde::Deserializer<'de>>(
-                self,
-                deserializer: D,
-            ) -> Result<Shared<T>, D::Error> {
-                if let Some(erased) = take_delivered() {
-                    return erased
-                        .try_rc::<T>()
-                        .map(Shared)
-                        .map_err(serde::de::Error::custom);
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a shared value")
                 }
-                let value = Rc::new(T::deserialize(deserializer)?);
-                publish(Erased::Rc(value.clone()));
-                Ok(Shared(value))
-            }
-        }
 
-        deserializer.deserialize_newtype_struct(SHARED_TOKEN, SharedVisitor(PhantomData))
-    }
-}
-
-impl<'de, T: Deserialize<'de> + Send + Sync + 'static> Deserialize<'de> for SharedArc<T> {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct SharedArcVisitor<T>(PhantomData<T>);
-
-        impl<'de, T: Deserialize<'de> + Send + Sync + 'static> Visitor<'de> for SharedArcVisitor<T> {
-            type Value = SharedArc<T>;
-
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a shared value")
-            }
-
-            fn visit_newtype_struct<D: serde::Deserializer<'de>>(
-                self,
-                deserializer: D,
-            ) -> Result<SharedArc<T>, D::Error> {
-                if let Some(erased) = take_delivered() {
-                    return erased
-                        .try_arc::<T>()
-                        .map(SharedArc)
-                        .map_err(serde::de::Error::custom);
+                fn visit_newtype_struct<D: serde::Deserializer<'de>>(
+                    self,
+                    deserializer: D,
+                ) -> Result<Shared<T>, D::Error> {
+                    if let Some(erased) = take_delivered() {
+                        return erased
+                            .try_rc::<T>()
+                            .map(Shared)
+                            .map_err(serde::de::Error::custom);
+                    }
+                    let value = Rc::new(T::deserialize(deserializer)?);
+                    publish(Erased::Rc(value.clone()));
+                    Ok(Shared(value))
                 }
-                let value = Arc::new(T::deserialize(deserializer)?);
-                publish(Erased::Arc(value.clone()));
-                Ok(SharedArc(value))
             }
-        }
 
-        deserializer.deserialize_newtype_struct(SHARED_TOKEN, SharedArcVisitor(PhantomData))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Columnar fast path.
-// ---------------------------------------------------------------------------
-
-fn require_active() -> Result<()> {
-    if active() {
-        Ok(())
-    } else {
-        Err(Error::Message(
-            "carbonite shared values must be (de)serialized through carbonite entry points"
-                .to_owned(),
-        ))
-    }
-}
-
-impl<T: SerializeColumns> SerializeColumns for Shared<T> {
-    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
-        require_active()?;
-        // The key column's Vec address identifies this schema position for
-        // the duration of one row (the column buffers never move mid-push).
-        let position = columns.as_ptr() as usize;
-        let addr = Rc::as_ptr(&self.0).cast::<()>() as usize;
-        match write_key(position, addr) {
-            WriteKey::Existing(key) => {
-                write_varint(&mut columns[0], key);
-                Ok(())
-            }
-            WriteKey::New(key) => {
-                write_varint(&mut columns[0], key);
-                self.0.serialize_columns(&mut columns[1..])
-            }
+            deserializer.deserialize_newtype_struct(SHARED_TOKEN, SharedVisitor(PhantomData))
         }
     }
-}
 
-impl<'de, T: DeserializeColumns<'de> + 'static> DeserializeColumns<'de> for Shared<T> {
-    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
-        require_active()?;
-        let position = cursors.as_ptr() as usize;
-        let key = cursors[0].varint()?;
-        match read_slot(position, key)? {
-            ReadSlot::Repeat(erased) => erased
-                .try_rc::<T>()
-                .map(Shared)
-                .map_err(|msg| Error::Message(msg.to_owned())),
-            ReadSlot::New(index) => {
-                let value = Rc::new(T::deserialize_columns(&mut cursors[1..])?);
-                fulfill(position, index, Erased::Rc(value.clone()));
-                Ok(Shared(value))
+    impl<'de, T: Deserialize<'de> + Send + Sync + 'static> Deserialize<'de> for SharedArc<T> {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct SharedArcVisitor<T>(PhantomData<T>);
+
+            impl<'de, T: Deserialize<'de> + Send + Sync + 'static> Visitor<'de> for SharedArcVisitor<T> {
+                type Value = SharedArc<T>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("a shared value")
+                }
+
+                fn visit_newtype_struct<D: serde::Deserializer<'de>>(
+                    self,
+                    deserializer: D,
+                ) -> Result<SharedArc<T>, D::Error> {
+                    if let Some(erased) = take_delivered() {
+                        return erased
+                            .try_arc::<T>()
+                            .map(SharedArc)
+                            .map_err(serde::de::Error::custom);
+                    }
+                    let value = Arc::new(T::deserialize(deserializer)?);
+                    publish(Erased::Arc(value.clone()));
+                    Ok(SharedArc(value))
+                }
             }
+
+            deserializer.deserialize_newtype_struct(SHARED_TOKEN, SharedArcVisitor(PhantomData))
         }
     }
-}
 
-impl<T: SerializeColumns> SerializeColumns for SharedArc<T> {
-    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
-        require_active()?;
-        let position = columns.as_ptr() as usize;
-        let addr = Arc::as_ptr(&self.0).cast::<()>() as usize;
-        match write_key(position, addr) {
-            WriteKey::Existing(key) => {
-                write_varint(&mut columns[0], key);
-                Ok(())
-            }
-            WriteKey::New(key) => {
-                write_varint(&mut columns[0], key);
-                self.0.serialize_columns(&mut columns[1..])
+    // ---------------------------------------------------------------------------
+    // Columnar fast path.
+    // ---------------------------------------------------------------------------
+
+    fn require_active() -> Result<()> {
+        if active() {
+            Ok(())
+        } else {
+            Err(Error::Message(
+                "carbonite shared values must be (de)serialized through carbonite entry points"
+                    .to_owned(),
+            ))
+        }
+    }
+
+    impl<T: SerializeColumns> SerializeColumns for Shared<T> {
+        fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+            require_active()?;
+            // The key column's Vec address identifies this schema position for
+            // the duration of one row (the column buffers never move mid-push).
+            let position = columns.as_ptr() as usize;
+            let addr = Rc::as_ptr(&self.0).cast::<()>() as usize;
+            match write_key(position, addr) {
+                WriteKey::Existing(key) => {
+                    write_varint(&mut columns[0], key);
+                    Ok(())
+                }
+                WriteKey::New(key) => {
+                    write_varint(&mut columns[0], key);
+                    self.0.serialize_columns(&mut columns[1..])
+                }
             }
         }
     }
-}
 
-impl<'de, T: DeserializeColumns<'de> + Send + Sync + 'static> DeserializeColumns<'de>
-    for SharedArc<T>
-{
-    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
-        require_active()?;
-        let position = cursors.as_ptr() as usize;
-        let key = cursors[0].varint()?;
-        match read_slot(position, key)? {
-            ReadSlot::Repeat(erased) => erased
-                .try_arc::<T>()
-                .map(SharedArc)
-                .map_err(|msg| Error::Message(msg.to_owned())),
-            ReadSlot::New(index) => {
-                let value = Arc::new(T::deserialize_columns(&mut cursors[1..])?);
-                fulfill(position, index, Erased::Arc(value.clone()));
-                Ok(SharedArc(value))
+    impl<'de, T: DeserializeColumns<'de> + 'static> DeserializeColumns<'de> for Shared<T> {
+        fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+            require_active()?;
+            let position = cursors.as_ptr() as usize;
+            let key = cursors[0].varint()?;
+            match read_slot(position, key)? {
+                ReadSlot::Repeat(erased) => erased
+                    .try_rc::<T>()
+                    .map(Shared)
+                    .map_err(|msg| Error::Message(msg.to_owned())),
+                ReadSlot::New(index) => {
+                    let value = Rc::new(T::deserialize_columns(&mut cursors[1..])?);
+                    fulfill(position, index, Erased::Rc(value.clone()));
+                    Ok(Shared(value))
+                }
             }
         }
+    }
+
+    impl<T: SerializeColumns> SerializeColumns for SharedArc<T> {
+        fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+            require_active()?;
+            let position = columns.as_ptr() as usize;
+            let addr = Arc::as_ptr(&self.0).cast::<()>() as usize;
+            match write_key(position, addr) {
+                WriteKey::Existing(key) => {
+                    write_varint(&mut columns[0], key);
+                    Ok(())
+                }
+                WriteKey::New(key) => {
+                    write_varint(&mut columns[0], key);
+                    self.0.serialize_columns(&mut columns[1..])
+                }
+            }
+        }
+    }
+
+    impl<'de, T: DeserializeColumns<'de> + Send + Sync + 'static> DeserializeColumns<'de>
+        for SharedArc<T>
+    {
+        fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+            require_active()?;
+            let position = cursors.as_ptr() as usize;
+            let key = cursors[0].varint()?;
+            match read_slot(position, key)? {
+                ReadSlot::Repeat(erased) => erased
+                    .try_arc::<T>()
+                    .map(SharedArc)
+                    .map_err(|msg| Error::Message(msg.to_owned())),
+                ReadSlot::New(index) => {
+                    let value = Arc::new(T::deserialize_columns(&mut cursors[1..])?);
+                    fulfill(position, index, Erased::Arc(value.clone()));
+                    Ok(SharedArc(value))
+                }
+            }
+        }
+    }
+
+    /// Whether a carbonite row scope is on the stack, so the handoff slots have
+    /// a consumer.
+    fn active() -> bool {
+        super::ACTIVE.with(|depth| depth.get() > 0)
+    }
+
+    /// Stashes write-side identity for the serializer to pick up alongside the
+    /// sentinel token.
+    fn stash_addr(addr: usize) {
+        if active() {
+            super::STASHED_ADDR.set(Some(addr));
+        }
+    }
+
+    /// Publishes a freshly materialized value for the deserializer to register.
+    fn publish(erased: Erased) {
+        if active() {
+            super::PUBLISHED.set(Some(erased));
+        }
+    }
+
+    /// Receives a repeated value the deserializer delivered.
+    fn take_delivered() -> Option<Erased> {
+        super::DELIVERED.take()
     }
 }
 
@@ -348,12 +418,20 @@ impl<'de, T: DeserializeColumns<'de> + Send + Sync + 'static> DeserializeColumns
 // ---------------------------------------------------------------------------
 
 /// A type-erased shared pointer held by the read registry.
+///
+/// Only the wrappers construct one, so with the `shared` feature off the
+/// variants are never built — but the registry and handoff slots still move
+/// the type around, so it stays.
 #[derive(Clone)]
+#[cfg_attr(not(feature = "shared"), allow(dead_code))]
 pub(crate) enum Erased {
     Rc(Rc<dyn Any>),
     Arc(Arc<dyn Any + Send + Sync>),
 }
 
+/// Downcasts back to concrete pointers; only the wrappers reconstruct
+/// sharing, so these live and die with the `shared` feature.
+#[cfg(feature = "shared")]
 impl Erased {
     fn try_rc<T: 'static>(self) -> Result<Rc<T>, &'static str> {
         match self {
@@ -405,24 +483,8 @@ thread_local! {
     static DELIVERED: RefCell<Option<Erased>> = const { RefCell::new(None) };
 }
 
-fn active() -> bool {
-    ACTIVE.with(|depth| depth.get() > 0)
-}
-
-fn stash_addr(addr: usize) {
-    if active() {
-        STASHED_ADDR.set(Some(addr));
-    }
-}
-
 pub(crate) fn take_stashed_addr() -> Option<usize> {
     STASHED_ADDR.take()
-}
-
-fn publish(erased: Erased) {
-    if active() {
-        PUBLISHED.set(Some(erased));
-    }
 }
 
 pub(crate) fn take_published() -> Option<Erased> {
@@ -431,10 +493,6 @@ pub(crate) fn take_published() -> Option<Erased> {
 
 pub(crate) fn deliver(erased: Erased) {
     DELIVERED.set(Some(erased));
-}
-
-fn take_delivered() -> Option<Erased> {
-    DELIVERED.take()
 }
 
 pub(crate) fn clear_delivered() {

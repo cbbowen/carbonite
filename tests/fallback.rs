@@ -6,9 +6,12 @@
 //! field is indistinguishable from a traced one".
 #![cfg(feature = "derive")]
 
+#[cfg(feature = "shared")]
 use std::rc::Rc;
 
-use carbonite::{Batch, Deserializer, Schema, Serializer, Shared, StaticSchema};
+#[cfg(feature = "shared")]
+use carbonite::Shared;
+use carbonite::{Batch, Deserializer, Schema, Serializer, StaticSchema};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -501,12 +504,14 @@ fn a_derived_schema_panics_on_an_untraceable_fallback_field() {
 
 /// Holds carbonite's `Shared` but has no derive of its own, so it can only
 /// reach a derived struct through the attribute.
+#[cfg(feature = "shared")]
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 struct Assets {
     meshes: Vec<Shared<String>>,
     count: u32,
 }
 
+#[cfg(feature = "shared")]
 #[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug, Clone)]
 struct Scene {
     id: u32,
@@ -514,6 +519,7 @@ struct Scene {
     assets: Assets,
 }
 
+#[cfg(feature = "shared")]
 #[test]
 fn shared_dedup_survives_the_boundary() {
     let mesh = Shared::from_ptr(Rc::new("teapot.obj".to_owned()));

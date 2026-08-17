@@ -289,13 +289,20 @@ assert_eq!(carbonite::from_slice_static::<Transform>(&bytes)?, transform);
 //! # Shared values
 //!
 //! serde's tree-shaped data model serializes an `Rc`/`Arc` pointee once per
-//! handle. [`Shared<T>`] (Rc) and [`SharedArc<T>`] (Arc) restore identity:
-//! within a row, each unique object is written once (a key column plus
-//! dictionary payload columns), and deserialization reconstructs the sharing
-//! so `Shared::ptr_eq` holds after a round trip. Both carbonite paths
-//! (serde-driven and columnar) implement the same encoding; in *other* serde
-//! formats the wrappers are invisible and duplicate inline, matching stock
-//! serde behavior. Sharing is per row; cyclic values error cleanly on read.
+//! handle. `Shared<T>` (Rc) and `SharedArc<T>` (Arc) — behind the **`shared`**
+//! feature, on by default — restore identity: within a row, each unique
+//! object is written once (a key column plus dictionary payload columns), and
+//! deserialization reconstructs the sharing so `Shared::ptr_eq` holds after a
+//! round trip. Both carbonite paths (serde-driven and columnar) implement the
+//! same encoding; in *other* serde formats the wrappers are invisible and
+//! duplicate inline, matching stock serde behavior. Sharing is per row;
+//! cyclic values error cleanly on read.
+//!
+//! One caveat: write-side uniqueness is decided by the pointee's *address*,
+//! so every handle serialized within a row must be alive at the same time —
+//! automatically true for handles stored in the value, but not for temporary
+//! wrappers manufactured inside a hand-written `Serialize` impl, whose
+//! reused allocations could silently alias. See the type docs.
 //!
 //! ```
 //! use serde::{Serialize, Deserialize};
@@ -390,6 +397,7 @@ pub use self_describing::{
     is_self_describing, peek_schema,
 };
 pub use ser::{Batch, Serializer};
+#[cfg(feature = "shared")]
 pub use shared::{Shared, SharedArc};
 pub use static_schema::StaticSchema;
 
