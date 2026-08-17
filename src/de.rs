@@ -139,6 +139,7 @@ impl<T: ?Sized> Deserializer<T> {
         if row_count != 1 {
             return Err(Error::Malformed("expected a single-value blob"));
         }
+        let _shared_scope = crate::shared::RowScope::begin();
         let value = T::deserialize_columns(&mut cursors)?;
         if !cursors.iter().all(Cursor::at_end) {
             return Err(Error::TrailingBytes);
@@ -208,6 +209,7 @@ where
             return None;
         }
         self.remaining -= 1;
+        let _shared_scope = crate::shared::RowScope::begin();
         let result = T::deserialize(ValueDeserializer {
             node: self.de.schema.node(),
             lnode: &self.de.layout.root,
@@ -410,6 +412,28 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                     fast: self.fast,
                 })
             }
+            // Shared data reached by a non-Shared reader (e.g. a field that
+            // used to be plain, or IgnoredAny): first occurrences
+            // materialize transparently; repeats cannot (there is no stored
+            // value to clone) and error via read_slot.
+            (SchemaNode::Shared(inner), LNode::Shared { key, inner: linner }) => {
+                let position = std::ptr::from_ref(&self.cursors[*key]) as usize;
+                let k = self.cursors[*key].varint()?;
+                match crate::shared::read_slot(position, k)? {
+                    crate::shared::ReadSlot::New(_reserved) => {
+                        // The reservation intentionally stays unfulfilled:
+                        // a plain reader produces no shareable pointer.
+                        ValueDeserializer {
+                            node: inner,
+                            lnode: linner,
+                            cursors: self.cursors,
+                            fast: self.fast,
+                        }
+                        .dispatch(visitor)
+                    }
+                    crate::shared::ReadSlot::Repeat(_) => Err(crate::shared::repeat_unavailable()),
+                }
+            }
             _ => unreachable!("layout was built from this schema"),
         }
     }
@@ -491,6 +515,14 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                     })?;
                 Self::skip_variant(&variants[index].1, &lvariants[index], cursors)?;
             }
+            (SchemaNode::Shared(inner), LNode::Shared { key, inner: linner }) => {
+                let position = std::ptr::from_ref(&cursors[*key]) as usize;
+                let k = cursors[*key].varint()?;
+                // Only first occurrences carry a payload to skip.
+                if crate::shared::read_skip(position, k)? {
+                    Self::skip(inner, linner, cursors)?;
+                }
+            }
             _ => unreachable!("layout was built from this schema"),
         }
         Ok(())
@@ -517,6 +549,68 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
             _ => unreachable!("layout was built from this schema"),
         }
     }
+
+    /// Runs the shared-value protocol for a `carbonite::Shared`/`SharedArc`
+    /// wrapper (recognized by its sentinel newtype name).
+    fn deserialize_shared_wrapper<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        match (self.node, self.lnode) {
+            (SchemaNode::Shared(inner), LNode::Shared { key, inner: linner }) => {
+                let position = std::ptr::from_ref(&self.cursors[*key]) as usize;
+                let k = self.cursors[*key].varint()?;
+                match crate::shared::read_slot(position, k)? {
+                    crate::shared::ReadSlot::Repeat(erased) => {
+                        // Hand the existing pointer to the wrapper via the
+                        // delivery slot; the guard deserializer ensures a
+                        // non-cooperating visitor fails instead of
+                        // desynchronizing the cursors.
+                        crate::shared::deliver(erased);
+                        let result = visitor.visit_newtype_struct(RepeatGuard);
+                        crate::shared::clear_delivered();
+                        result
+                    }
+                    crate::shared::ReadSlot::New(reserved) => {
+                        let value = visitor.visit_newtype_struct(ValueDeserializer {
+                            node: inner,
+                            lnode: linner,
+                            cursors: self.cursors,
+                            fast: self.fast,
+                        })?;
+                        let erased = crate::shared::take_published().ok_or_else(|| {
+                            Error::Message(
+                                "carbonite::Shared protocol violation: no shared value was \
+                                 published"
+                                    .to_owned(),
+                            )
+                        })?;
+                        crate::shared::fulfill(position, reserved, erased);
+                        Ok(value)
+                    }
+                }
+            }
+            // A shared wrapper reading pre-Shared (plain) data: every
+            // occurrence materializes a fresh value.
+            _ => visitor.visit_newtype_struct(self),
+        }
+    }
+}
+
+/// Stands in for the payload of a repeated shared value: the data was
+/// consumed at the first occurrence, so any attempt to actually read is an
+/// error (it means the visitor was not a `carbonite::Shared` wrapper).
+struct RepeatGuard;
+
+impl<'de> de::Deserializer<'de> for RepeatGuard {
+    type Error = Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value> {
+        Err(crate::shared::repeat_unavailable())
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map struct enum identifier ignored_any
+    }
 }
 
 impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
@@ -542,9 +636,20 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
         visitor.visit_unit()
     }
 
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value> {
+        if name == crate::shared::SHARED_TOKEN {
+            return self.deserialize_shared_wrapper(visitor);
+        }
+        self.dispatch(visitor)
+    }
+
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf unit unit_struct newtype_struct seq tuple tuple_struct
+        bytes byte_buf unit unit_struct seq tuple tuple_struct
         map struct enum identifier
     }
 

@@ -185,6 +185,11 @@ pub enum SchemaNode {
         /// `(variant name, variant shape)` in declaration order.
         variants: Vec<(String, VariantNode)>,
     },
+    /// A per-row-deduplicated value ([`Shared`](crate::Shared) /
+    /// [`SharedArc`](crate::SharedArc)): a varint key column (one entry per
+    /// occurrence); the inner value's columns form a dictionary with one
+    /// entry per unique object, in first-occurrence order.
+    Shared(Box<SchemaNode>),
 }
 
 /// The shape of one enum variant.
@@ -217,6 +222,7 @@ impl SchemaNode {
             SchemaNode::Map { .. } => "map".to_owned(),
             SchemaNode::Struct { name, .. } => format!("struct `{name}`"),
             SchemaNode::Enum { name, .. } => format!("enum `{name}`"),
+            SchemaNode::Shared(inner) => format!("shared<{}>", inner.describe()),
         }
     }
 
@@ -304,6 +310,10 @@ impl SchemaNode {
                     variant.encode_into(out);
                 }
             }
+            SchemaNode::Shared(inner) => {
+                out.push(26);
+                inner.encode_into(out);
+            }
         }
     }
 
@@ -369,6 +379,7 @@ impl SchemaNode {
                 }
                 SchemaNode::Enum { name, variants }
             }
+            26 => SchemaNode::Shared(Box::new(Self::decode(buf, pos, depth + 1)?)),
             _ => return Err(Error::Malformed("unknown schema node tag")),
         })
     }
@@ -605,6 +616,10 @@ mod tests {
                     },
                 ),
                 ("unit".to_owned(), SchemaNode::Unit),
+                (
+                    "mesh".to_owned(),
+                    SchemaNode::Shared(Box::new(SchemaNode::String)),
+                ),
             ],
         }
     }

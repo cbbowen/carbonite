@@ -93,6 +93,7 @@ enum TNode {
     Map(Box<TNode>, Box<TNode>),
     Struct(&'static str, Vec<(&'static str, TNode)>),
     Enum(&'static str, Vec<(&'static str, Option<TVariant>)>),
+    Shared(Box<TNode>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -147,6 +148,7 @@ impl TNode {
                     })
                     .collect(),
             },
+            TNode::Shared(inner) => SchemaNode::Shared(Box::new(inner.into_schema())),
         }
     }
 }
@@ -174,9 +176,10 @@ fn node_has_unexplored(node: &TNode) -> bool {
         TNode::Primitive(_) | TNode::String | TNode::Bytes | TNode::Unit | TNode::UnitStruct(_) => {
             false
         }
-        TNode::Option(inner) | TNode::NewtypeStruct(_, inner) | TNode::Seq(inner) => {
-            node_has_unexplored(inner)
-        }
+        TNode::Option(inner)
+        | TNode::NewtypeStruct(_, inner)
+        | TNode::Seq(inner)
+        | TNode::Shared(inner) => node_has_unexplored(inner),
         TNode::Tuple(fields) | TNode::TupleStruct(_, fields) => {
             fields.iter().any(node_has_unexplored)
         }
@@ -203,9 +206,10 @@ fn count_variants(node: &TNode) -> usize {
         TNode::Primitive(_) | TNode::String | TNode::Bytes | TNode::Unit | TNode::UnitStruct(_) => {
             0
         }
-        TNode::Option(inner) | TNode::NewtypeStruct(_, inner) | TNode::Seq(inner) => {
-            count_variants(inner)
-        }
+        TNode::Option(inner)
+        | TNode::NewtypeStruct(_, inner)
+        | TNode::Seq(inner)
+        | TNode::Shared(inner) => count_variants(inner),
         TNode::Tuple(fields) | TNode::TupleStruct(_, fields) => {
             fields.iter().map(count_variants).sum()
         }
@@ -250,6 +254,7 @@ fn merge(a: TNode, b: TNode) -> Result<TNode> {
             TNode::NewtypeStruct(n, Box::new(merge(*x, *y)?))
         }
         (TNode::Seq(x), TNode::Seq(y)) => TNode::Seq(Box::new(merge(*x, *y)?)),
+        (TNode::Shared(x), TNode::Shared(y)) => TNode::Shared(Box::new(merge(*x, *y)?)),
         (TNode::Tuple(xs), TNode::Tuple(ys)) if xs.len() == ys.len() => {
             TNode::Tuple(merge_all(xs, ys)?)
         }
@@ -508,6 +513,24 @@ impl<'de> de::Deserializer<'de> for Tracer<'_, '_> {
         visitor: V,
     ) -> Result<V::Value> {
         let depth = self.deeper()?;
+        // carbonite's shared wrappers announce themselves through a sentinel
+        // newtype name; record a Shared node instead of a newtype struct.
+        if name == crate::shared::SHARED_TOKEN {
+            let prior = match self.prior {
+                Some(TNode::Shared(inner)) => Some(&**inner),
+                _ => None,
+            };
+            let mut inner = None;
+            let value = visitor.visit_newtype_struct(Tracer {
+                out: &mut inner,
+                prior,
+                depth,
+            })?;
+            let inner = inner
+                .ok_or_else(|| untraceable("a shared impl returned without consuming input"))?;
+            *self.out = Some(TNode::Shared(Box::new(inner)));
+            return Ok(value);
+        }
         let prior = match self.prior {
             Some(TNode::NewtypeStruct(_, inner)) => Some(&**inner),
             _ => None,

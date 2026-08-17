@@ -49,6 +49,11 @@ pub(crate) enum LNode {
         tag: ColId,
         variants: Vec<LNode>,
     },
+    /// Shared value: key column plus the dictionary's payload columns.
+    Shared {
+        key: ColId,
+        inner: Box<LNode>,
+    },
 }
 
 impl Layout {
@@ -104,6 +109,10 @@ fn build(node: &SchemaNode, next: &mut usize) -> LNode {
                 .collect();
             LNode::Enum { tag, variants }
         }
+        SchemaNode::Shared(inner) => LNode::Shared {
+            key: alloc(next),
+            inner: Box::new(build(inner, next)),
+        },
     }
 }
 

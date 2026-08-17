@@ -120,6 +120,7 @@ impl<T: ?Sized> Batch<'_, T> {
     {
         self.rollback.clear();
         self.rollback.extend(self.columns.iter().map(Vec::len));
+        let _shared_scope = crate::shared::RowScope::begin();
         let result = value.serialize(ValueSerializer {
             node: self.root_node,
             lnode: self.root_lnode,
@@ -161,6 +162,7 @@ impl<T: ?Sized> Batch<'_, T> {
         }
         self.rollback.clear();
         self.rollback.extend(self.columns.iter().map(Vec::len));
+        let _shared_scope = crate::shared::RowScope::begin();
         match value.serialize_columns(&mut self.columns) {
             Ok(()) => {
                 self.rows += 1;
@@ -393,6 +395,37 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
         name: &'static str,
         value: &V,
     ) -> Result<()> {
+        if name == crate::shared::SHARED_TOKEN {
+            return match (self.node, self.lnode) {
+                (SchemaNode::Shared(inner), LNode::Shared { key, inner: linner }) => {
+                    let addr = crate::shared::take_stashed_addr().ok_or_else(|| {
+                        Error::Message(
+                            "carbonite::Shared protocol violation: shared token without a \
+                             stashed address"
+                                .to_owned(),
+                        )
+                    })?;
+                    let position = std::ptr::from_ref(&self.columns[*key]) as usize;
+                    match crate::shared::write_key(position, addr) {
+                        crate::shared::WriteKey::Existing(k) => {
+                            varint::write(&mut self.columns[*key], k);
+                            Ok(())
+                        }
+                        crate::shared::WriteKey::New(k) => {
+                            varint::write(&mut self.columns[*key], k);
+                            value.serialize(ValueSerializer {
+                                node: inner,
+                                lnode: linner,
+                                columns: self.columns,
+                            })
+                        }
+                    }
+                }
+                // A shared wrapper serialized against a non-shared schema
+                // (e.g. an older one): transparent, duplicates inline.
+                _ => value.serialize(self),
+            };
+        }
         match (self.node, self.lnode) {
             (
                 SchemaNode::NewtypeStruct {

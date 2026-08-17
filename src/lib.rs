@@ -104,6 +104,39 @@
 //! # Ok::<(), carbonite::Error>(())
 //! ```
 //!
+//! # Shared values
+//!
+//! serde's tree-shaped data model serializes an `Rc`/`Arc` pointee once per
+//! handle. [`Shared<T>`] (Rc) and [`SharedArc<T>`] (Arc) restore identity:
+//! within a row, each unique object is written once (a key column plus
+//! dictionary payload columns), and deserialization reconstructs the sharing
+//! so `Shared::ptr_eq` holds after a round trip. Both carbonite paths
+//! (serde-driven and columnar) implement the same encoding; in *other* serde
+//! formats the wrappers are invisible and duplicate inline, matching stock
+//! serde behavior. Sharing is per row; cyclic values error cleanly on read.
+//!
+//! ```
+//! use serde::{Serialize, Deserialize};
+//! use carbonite::Shared;
+//!
+//! #[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug, Clone)]
+//! struct Entity {
+//!     id: u32,
+//!     mesh: Shared<String>,
+//! }
+//!
+//! let mesh = Shared::new("teapot.obj".to_owned());
+//! let scene = vec![
+//!     Entity { id: 1, mesh: mesh.clone() },
+//!     Entity { id: 2, mesh: mesh.clone() },
+//! ];
+//!
+//! let bytes = carbonite::to_vec(&scene)?;   // "teapot.obj" written once
+//! let back: Vec<Entity> = carbonite::from_slice(&bytes)?;
+//! assert!(Shared::ptr_eq(&back[0].mesh, &back[1].mesh));
+//! # Ok::<(), carbonite::Error>(())
+//! ```
+//!
 //! # Limitations
 //!
 //! The data layer is not self-describing, so serde features that require a
@@ -122,6 +155,7 @@ mod layout;
 mod schema;
 mod self_describing;
 mod ser;
+mod shared;
 mod static_schema;
 mod trace;
 mod varint;
@@ -132,6 +166,7 @@ pub use error::{Error, Result};
 pub use schema::{Primitive, Schema, SchemaNode, VariantNode};
 pub use self_describing::{SelfDescribingDeserializer, SelfDescribingSerializer};
 pub use ser::{Batch, Serializer};
+pub use shared::{Shared, SharedArc};
 pub use static_schema::StaticSchema;
 
 /// Derives [`StaticSchema`]: a compile-time schema identical to what runtime
