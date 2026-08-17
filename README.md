@@ -182,10 +182,6 @@ produces an `Error`, never a panic, an abort, or an unbounded allocation. The on
 data cannot bound is a repetition of a value that occupies no columns — `Vec<()>` and friends,
 which encode nothing per element — so those are capped at `MAX_ZERO_COLUMN_REPEAT`.
 
-Blob bytes are canonical for a given value, with one exception: `HashMap`/`HashSet` serialize
-in iteration order, which varies between runs. Use `BTreeMap`/`BTreeSet` where reproducible
-bytes matter.
-
 ## License
 
 MIT OR Apache-2.0
