@@ -143,7 +143,7 @@ Every row below is a test in `tests/evolution.rs` or `tests/shape_evolution.rs`.
 | Add a variant, anywhere in the list | ✓ | — |
 | Reorder variants | ✓ | — |
 | Rename a variant | ✓ | `#[serde(alias = "Old")]` |
-| Remove a variant | ✓ | — (data that used it is reported) |
+| Remove a variant | ⚠ | succeeds only for data that never used it |
 | Add or remove a variant's fields | ✓ | as for struct fields |
 | Give a unit variant *named* fields | ✓ | `#[serde(default)]` on each |
 | Take a variant's payload away | ✓ | — (it is skipped) |
