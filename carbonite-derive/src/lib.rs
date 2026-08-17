@@ -8,13 +8,18 @@
 //! To keep the tracing-equivalence guarantee it mirrors the serde attributes
 //! that affect the wire shape (`rename`, `rename_all`, `rename_all_fields`,
 //! `skip`, `transparent`) and rejects, at compile time, the ones carbonite
-//! cannot represent (`flatten`, `untagged`, `tag`/`content`, `with`,
-//! `from`/`into`, `skip_serializing_if`, and asymmetric skips).
+//! cannot represent (`flatten`, `untagged`, `tag`/`content`, `with`, `remote`,
+//! `skip_serializing_if`, and asymmetric skips).
 //!
-//! Two carbonite attributes of its own:
+//! Three carbonite attributes of its own:
 //!
 //! - `#[carbonite(crate = "...")]` on the container points the generated code
 //!   at a renamed carbonite dependency.
+//! - `#[carbonite(as = "Repr")]` on the container replaces the field-based
+//!   derivation entirely: the schema and both columnar directions come from
+//!   `Repr`, which is how `#[serde(from)]` / `#[serde(into)]` /
+//!   `#[serde(try_from)]` are supported — serde's pair may name two different
+//!   shapes, so carbonite is told the wire type once.
 //! - `#[carbonite(serde)]` on a field opts that field out of the compile-time
 //!   machinery: its schema comes from a runtime trace and its data goes
 //!   through the serde path, which is what makes foreign types that only ship
@@ -39,8 +44,26 @@ pub fn derive_schema(input: TokenStream) -> TokenStream {
 }
 
 fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
-    let krate = parse_crate_path(&input.attrs)?;
+    let CarboniteAttrs { krate, repr } = parse_carbonite_attrs(&input.attrs)?;
     let container = parse_container_attrs(&input.attrs)?;
+
+    // `#[carbonite(as = "...")]` replaces the whole field-based derivation: the
+    // fields are not what reaches the wire.
+    if let Some(repr) = &repr {
+        return expand_as(input, &container, repr, &krate);
+    }
+    if let Some(conversion) = container.de_repr.as_ref().or(container.ser_repr.as_ref()) {
+        return Err(syn::Error::new_spanned(
+            &conversion.ty,
+            format!(
+                "carbonite cannot infer a schema from serde({}) alone, because serde(from) and \
+                 serde(into) may name different shapes while carbonite has one schema for both \
+                 directions; declare the wire type with `#[carbonite(as = \"{}\")]`",
+                conversion.attr, conversion.text,
+            ),
+        ));
+    }
+
     let name = container
         .rename
         .clone()
@@ -106,24 +129,223 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     })
 }
 
-/// Reads `#[carbonite(crate = "...")]`, defaulting to `::carbonite`.
-fn parse_crate_path(attrs: &[syn::Attribute]) -> syn::Result<Path> {
-    let mut path: Path = parse_quote!(::carbonite);
+// ---------------------------------------------------------------------------
+// `#[carbonite(as = "Repr")]`: the type is represented as another type.
+//
+// serde's `from`/`into` pair can name two different shapes, and carbonite has
+// one schema for both directions, so the attribute states the wire type once:
+// the schema, the column count, and both columnar directions all come from
+// `Repr`, and the container's own fields never reach the wire. Reading converts
+// through `TryFrom` (which covers `From` via its blanket impl, so serde(from)
+// and serde(try_from) share one code path) and writing through `Into` on a
+// clone, exactly as serde's own `from`/`into` codegen does.
+// ---------------------------------------------------------------------------
+
+fn expand_as(
+    input: &DeriveInput,
+    container: &ContainerAttrs,
+    repr: &syn::Type,
+    krate: &Path,
+) -> syn::Result<TokenStream2> {
+    if container.transparent {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "serde(transparent) and carbonite(as) describe different wire types for the same \
+             container; keep only one",
+        ));
+    }
+    // The fields play no part in the wire shape, so any per-field carbonite
+    // attribute on them is dead configuration.
+    for (ty, fallback) in field_uses(&input.data)? {
+        if fallback {
+            return Err(syn::Error::new_spanned(
+                ty,
+                "carbonite(serde) has no effect here: with carbonite(as) on the container, the \
+                 fields do not reach the wire",
+            ));
+        }
+    }
+    // serde must convert in *both* directions, or its own impls disagree with
+    // the schema this attribute declares.
+    match (&container.de_repr, &container.ser_repr) {
+        (Some(de), None) => {
+            return Err(syn::Error::new_spanned(
+                &de.ty,
+                format!(
+                    "serde({}) converts only when reading, so this type still *writes* its own \
+                     fields and would not match the declared schema; add \
+                     `#[serde(into = \"{}\")]`",
+                    de.attr, de.text,
+                ),
+            ));
+        }
+        (None, Some(ser)) => {
+            return Err(syn::Error::new_spanned(
+                &ser.ty,
+                format!(
+                    "serde(into) converts only when writing, so this type still *reads* into its \
+                     own fields and would not match the declared schema; add \
+                     `#[serde(from = \"{}\")]`",
+                    ser.text,
+                ),
+            ));
+        }
+        _ => {}
+    }
+
+    let ident = &input.ident;
+    let (_, ty_generics, _) = input.generics.split_for_impl();
+
+    let mut static_generics = input.generics.clone();
+    static_generics
+        .make_where_clause()
+        .predicates
+        .push(parse_quote!(#repr: #krate::StaticSchema));
+    let (static_impl_generics, _, static_where) = static_generics.split_for_impl();
+
+    let mut ser_generics = input.generics.clone();
+    {
+        let predicates = &mut ser_generics.make_where_clause().predicates;
+        predicates.push(parse_quote!(#repr: #krate::SerializeColumns));
+        predicates.push(parse_quote!(Self: ::core::clone::Clone + ::core::convert::Into<#repr>));
+    }
+    let (ser_impl_generics, _, ser_where) = ser_generics.split_for_impl();
+
+    let mut de_generics = input.generics.clone();
+    {
+        let predicates = &mut de_generics.make_where_clause().predicates;
+        predicates.push(parse_quote!(#repr: #krate::DeserializeColumns<'de>));
+        predicates.push(parse_quote!(Self: ::core::convert::TryFrom<#repr>));
+        predicates.push(
+            parse_quote!(<Self as ::core::convert::TryFrom<#repr>>::Error: ::core::fmt::Display),
+        );
+        for lifetime_def in input.generics.lifetimes() {
+            let lifetime = &lifetime_def.lifetime;
+            predicates.push(parse_quote!('de: #lifetime));
+        }
+    }
+    de_generics.params.insert(0, parse_quote!('de));
+    let (de_impl_generics, _, de_where) = de_generics.split_for_impl();
+
+    let assertions = repr_assertions(input, container, repr);
+
+    Ok(quote! {
+        #assertions
+
+        #[automatically_derived]
+        impl #static_impl_generics #krate::StaticSchema for #ident #ty_generics #static_where {
+            fn schema_node() -> #krate::SchemaNode {
+                <#repr as #krate::StaticSchema>::schema_node()
+            }
+
+            #[inline]
+            fn columns() -> usize {
+                <#repr as #krate::StaticSchema>::columns()
+            }
+
+            const FIXED_WIDTH: ::core::option::Option<usize> =
+                <#repr as #krate::StaticSchema>::FIXED_WIDTH;
+        }
+
+        #[automatically_derived]
+        impl #ser_impl_generics #krate::SerializeColumns for #ident #ty_generics #ser_where {
+            fn serialize_columns(
+                &self,
+                columns: &mut [::std::vec::Vec<u8>],
+            ) -> #krate::Result<()> {
+                let __repr: #repr = ::core::convert::Into::into(::core::clone::Clone::clone(self));
+                #krate::SerializeColumns::serialize_columns(&__repr, columns)
+            }
+        }
+
+        #[automatically_derived]
+        impl #de_impl_generics #krate::DeserializeColumns<'de> for #ident #ty_generics #de_where {
+            fn deserialize_columns(
+                cursors: &mut [#krate::ColumnCursor<'de>],
+            ) -> #krate::Result<Self> {
+                let __repr =
+                    <#repr as #krate::DeserializeColumns<'de>>::deserialize_columns(cursors)?;
+                ::core::convert::TryFrom::try_from(__repr)
+                    .map_err(#krate::columnar::__conversion_failed)
+            }
+        }
+    })
+}
+
+/// Checks that the type serde converts through really is the one
+/// `#[carbonite(as = "...")]` declares — as a function that hands one back as
+/// the other, so the compiler resolves both paths instead of comparing them
+/// textually. Skipped when either mentions a type parameter, which is out of
+/// scope here.
+fn repr_assertions(
+    input: &DeriveInput,
+    container: &ContainerAttrs,
+    repr: &syn::Type,
+) -> TokenStream2 {
+    let params: Vec<&syn::Ident> = input.generics.type_params().map(|p| &p.ident).collect();
+    let lifetimes: Vec<&syn::LifetimeParam> = input.generics.lifetimes().collect();
+    let generics = (!lifetimes.is_empty()).then(|| quote!(<#(#lifetimes),*>));
+
+    let checks: Vec<TokenStream2> = [&container.de_repr, &container.ser_repr]
+        .into_iter()
+        .flatten()
+        .filter(|conversion| {
+            !params
+                .iter()
+                .any(|param| mentions(&conversion.ty, param) || mentions(repr, param))
+        })
+        .enumerate()
+        .map(|(index, conversion)| {
+            let name = format_ident!("__assert_carbonite_repr{index}");
+            let serde_repr = &conversion.ty;
+            quote_spanned! { repr.span() =>
+                #[allow(dead_code)]
+                fn #name #generics (repr: #serde_repr) -> #repr {
+                    repr
+                }
+            }
+        })
+        .collect();
+    if checks.is_empty() {
+        return TokenStream2::new();
+    }
+    quote!(const _: () = { #(#checks)* };)
+}
+
+/// The container's own carbonite attributes.
+struct CarboniteAttrs {
+    /// `#[carbonite(crate = "...")]`, defaulting to `::carbonite`.
+    krate: Path,
+    /// `#[carbonite(as = "...")]`: the type this one is represented as on the
+    /// wire, in *both* directions.
+    repr: Option<syn::Type>,
+}
+
+fn parse_carbonite_attrs(attrs: &[syn::Attribute]) -> syn::Result<CarboniteAttrs> {
+    let mut out = CarboniteAttrs {
+        krate: parse_quote!(::carbonite),
+        repr: None,
+    };
     for attr in attrs {
         if !attr.path().is_ident("carbonite") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("crate") {
-                path = meta.value()?.parse::<LitStr>()?.parse()?;
+                out.krate = meta.value()?.parse::<LitStr>()?.parse()?;
+                Ok(())
+            } else if meta.path.is_ident("as") {
+                out.repr = Some(meta.value()?.parse::<LitStr>()?.parse()?);
                 Ok(())
             } else {
-                Err(meta
-                    .error("unrecognized carbonite attribute; the only one is `crate = \"...\"`"))
+                Err(meta.error(
+                    "unrecognized carbonite container attribute; the two are \
+                     `crate = \"...\"` and `as = \"...\"`",
+                ))
             }
         })?;
     }
-    Ok(path)
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +1073,19 @@ struct ContainerAttrs {
     rename_all: Option<RenameRule>,
     rename_all_fields: Option<RenameRule>,
     transparent: bool,
+    /// `serde(from)` / `serde(try_from)`: what the type deserializes *from*.
+    de_repr: Option<Conversion>,
+    /// `serde(into)`: what the type serializes *into*.
+    ser_repr: Option<Conversion>,
+}
+
+/// A type named by one of serde's conversion attributes.
+struct Conversion {
+    ty: syn::Type,
+    /// Which attribute named it, for error messages.
+    attr: &'static str,
+    /// The type exactly as it was spelled, for error messages.
+    text: String,
 }
 
 #[derive(Default)]
@@ -892,14 +1127,20 @@ fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerAttrs
                     "carbonite cannot derive Schema for untagged or internally/adjacently \
                      tagged enums; only externally tagged (default) enums have a columnar layout",
                 ));
-            } else if meta.path.is_ident("from")
-                || meta.path.is_ident("into")
-                || meta.path.is_ident("try_from")
-                || meta.path.is_ident("remote")
-            {
+            } else if meta.path.is_ident("from") || meta.path.is_ident("try_from") {
+                let attr = if meta.path.is_ident("from") {
+                    "from"
+                } else {
+                    "try_from"
+                };
+                out.de_repr = Some(parse_conversion(&meta, attr)?);
+            } else if meta.path.is_ident("into") {
+                out.ser_repr = Some(parse_conversion(&meta, "into")?);
+            } else if meta.path.is_ident("remote") {
                 return Err(meta.error(
-                    "carbonite cannot statically derive Schema for containers using \
-                     serde(from/into/try_from/remote); use runtime tracing (Schema::new) instead",
+                    "carbonite cannot derive Schema for serde(remote): the generated code is a \
+                     module of conversion functions rather than impls on this type, so there is \
+                     nothing to hang a schema on",
                 ));
             } else {
                 skip_meta(&meta)?;
@@ -1024,6 +1265,15 @@ fn expect_str_value(meta: &ParseNestedMeta) -> syn::Result<String> {
              are not supported",
         )),
     }
+}
+
+fn parse_conversion(meta: &ParseNestedMeta, attr: &'static str) -> syn::Result<Conversion> {
+    let literal = meta.value()?.parse::<LitStr>()?;
+    Ok(Conversion {
+        ty: literal.parse()?,
+        attr,
+        text: literal.value(),
+    })
 }
 
 fn parse_rename_rule(meta: &ParseNestedMeta) -> syn::Result<RenameRule> {

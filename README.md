@@ -114,6 +114,42 @@ let save: Save = carbonite::from_slice(&old_file).unwrap();
 assert_eq!(save, Save { title: "Ada".into(), hp: 90, mana: 0 });
 ```
 
+## Types represented as another type
+
+`#[serde(from)]` / `#[serde(into)]` (and `try_from`) let a type keep invariants its wire form
+does not carry. The pair can name two *different* shapes, though, and carbonite has one schema
+for both directions — so it asks for the wire type once, with `#[carbonite(as = "...")]`.
+
+```rust
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug, Clone)]
+#[serde(from = "f64", into = "f64")]
+#[carbonite(as = "f64")]
+struct Degrees(f64);
+
+impl From<f64> for Degrees {
+    fn from(raw: f64) -> Self { Degrees(raw.rem_euclid(360.0)) }   // normalizes on read
+}
+impl From<Degrees> for f64 {
+    fn from(angle: Degrees) -> f64 { angle.0 }
+}
+
+// The schema, the columns, and the bytes are `f64`'s.
+let bytes = carbonite::to_vec_static(&Degrees(37.5)).unwrap();
+assert_eq!(bytes, carbonite::to_vec_static(&37.5f64).unwrap());
+assert_eq!(carbonite::from_slice_static::<Degrees>(&bytes).unwrap(), Degrees(37.5));
+
+// A 400-degree file comes back normalized: the conversion runs on read.
+let wrapped = carbonite::to_vec_static(&400.0f64).unwrap();
+assert_eq!(carbonite::from_slice_static::<Degrees>(&wrapped).unwrap(), Degrees(40.0));
+```
+
+The container's fields never reach the wire, so nothing is traced or interpreted at runtime —
+the repr's monomorphized path does the work, with the conversion around it. This also *enables*
+types tracing cannot reach: a validating `try_from` rejects the synthetic values `Schema::new`
+feeds it, so such a type (and anything containing one) is derive-only.
+
 ## Fields from crates that only know serde
 
 `#[derive(Schema)]` needs a compile-time schema for every field type — which the orphan rule

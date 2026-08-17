@@ -170,6 +170,13 @@ pub fn __invalid_variant(tag: u64) -> Error {
     }
 }
 
+/// Reports a failed `#[carbonite(as = "...")]` conversion, with the same
+/// message the serde path produces for a `serde(try_from)` failure.
+#[doc(hidden)]
+pub fn __conversion_failed<E: fmt::Display>(err: E) -> Error {
+    Error::Message(err.to_string())
+}
+
 #[doc(hidden)]
 pub fn __skipped_variant(name: &'static str) -> Error {
     Error::Message(format!(

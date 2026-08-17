@@ -123,6 +123,69 @@
 //! # Ok::<(), carbonite::Error>(())
 //! ```
 //!
+//! # Types represented as another type
+//!
+//! serde's `#[serde(from = "...")]` / `#[serde(into = "...")]` let a type keep
+//! invariants its wire form does not carry. The pair can name two *different*
+//! shapes, though, and carbonite has one schema for both directions — so
+//! carbonite asks for the wire type once, with `#[carbonite(as = "...")]`:
+//!
+//! ```
+//! use serde::{Serialize, Deserialize};
+//!
+//! #[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug, Clone)]
+//! #[serde(try_from = "String", into = "String")]
+//! #[carbonite(as = "String")]
+//! enum Mode {
+//!     Fast,
+//!     Small,
+//! }
+//!
+//! impl TryFrom<String> for Mode {
+//!     type Error = String;
+//!     fn try_from(raw: String) -> Result<Self, String> {
+//!         match raw.as_str() {
+//!             "fast" => Ok(Mode::Fast),
+//!             "small" => Ok(Mode::Small),
+//!             other => Err(format!("unknown mode `{other}`")),
+//!         }
+//!     }
+//! }
+//!
+//! impl From<Mode> for String {
+//!     fn from(mode: Mode) -> String {
+//!         match mode {
+//!             Mode::Fast => "fast".to_owned(),
+//!             Mode::Small => "small".to_owned(),
+//!         }
+//!     }
+//! }
+//!
+//! // The schema, the columns, and the bytes are the repr's: a peer holding
+//! // only `String` reads the blob with no idea a conversion happened.
+//! let bytes = carbonite::to_vec_static(&Mode::Small)?;
+//! assert_eq!(carbonite::from_slice::<String>(&bytes)?, "small");
+//! assert_eq!(carbonite::from_slice_static::<Mode>(&bytes)?, Mode::Small);
+//! # Ok::<(), carbonite::Error>(())
+//! ```
+//!
+//! The container's own fields never reach the wire, so nothing is traced or
+//! interpreted at runtime: reading converts through `TryFrom` (which covers
+//! `From` too) and writing through `Into` on a clone, exactly as serde's own
+//! codegen does, around the repr's monomorphized columnar path. A failed
+//! conversion surfaces the same error on both paths.
+//!
+//! `as` also *enables* types tracing cannot reach at all. A validating
+//! conversion rejects the synthetic values [`Schema::new`] feeds it, so
+//! `Schema::<Mode>::new()` fails — and so would tracing any type containing a
+//! `Mode`. The derive is unaffected, which makes [`StaticSchema::schema`] and
+//! the `_static` entry points the way to use such a type.
+//!
+//! The attribute states what the type's serde impls *do*; carbonite cannot
+//! verify that beyond checking any `serde(from)`/`serde(into)` attributes name
+//! the same type, so hand-written impls carry the same
+//! [caveat](derive@Schema#the-types-serde-impls-must-match) as always.
+//!
 //! # Fields whose types come from another crate
 //!
 //! `#[derive(Schema)]` needs a compile-time schema for every field type, which
@@ -296,10 +359,14 @@ pub use schema::{Primitive, SchemaNode, VariantNode};
 /// `rename_all`, `rename_all_fields`, `skip`, `transparent`) and rejects, at
 /// compile time, the ones carbonite cannot represent.
 ///
-/// Two attributes of its own:
+/// Three attributes of its own:
 ///
 /// - `#[carbonite(crate = "...")]` on the container points the generated code
 ///   at a renamed carbonite dependency.
+/// - `#[carbonite(as = "Repr")]` on the container declares that the type is
+///   [represented as `Repr`](crate#types-represented-as-another-type) on the
+///   wire, in both directions — how carbonite supports `#[serde(from)]` /
+///   `#[serde(into)]` / `#[serde(try_from)]`.
 /// - `#[carbonite(serde)]` on a field takes that field's schema from a runtime
 ///   trace and routes its data through the serde path, which is what lets a
 ///   derived type hold [foreign types](crate#fields-whose-types-come-from-another-crate)
