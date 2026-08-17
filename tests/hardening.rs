@@ -364,3 +364,35 @@ fn wide_element_claims_fail_cleanly_without_a_matching_reservation() {
         other => panic!("expected a clean decode failure, got {other:?}"),
     }
 }
+
+/// No writer produces nanoseconds >= 1e9, but a forged blob can. std's serde
+/// impl carries them into the seconds (erroring only when the carry cannot
+/// fit), and the two engines must agree on every input, so the fast path
+/// matches rather than being stricter.
+#[test]
+fn the_two_engines_agree_on_overflowing_duration_nanoseconds() {
+    use std::time::Duration;
+    let de = Deserializer::new_static(Duration::schema());
+
+    let forged = blob(
+        1,
+        &[
+            5u64.to_le_bytes().to_vec(),
+            1_500_000_000u32.to_le_bytes().to_vec(),
+        ],
+    );
+    let via_serde: Duration = de.from_slice(&forged).unwrap();
+    let via_columns: Duration = de.from_slice_columns(&forged).unwrap();
+    assert_eq!(via_serde, Duration::new(6, 500_000_000));
+    assert_eq!(via_columns, via_serde);
+
+    let overflow = blob(
+        1,
+        &[
+            u64::MAX.to_le_bytes().to_vec(),
+            1_500_000_000u32.to_le_bytes().to_vec(),
+        ],
+    );
+    assert!(de.from_slice(&overflow).is_err());
+    assert!(de.from_slice_columns(&overflow).is_err());
+}

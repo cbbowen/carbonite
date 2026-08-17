@@ -107,23 +107,19 @@ scope would close the hazard outright, but the `Serialize` impl lacks a
 
 ## 4. Smaller correctness / consistency nits
 
-- [ ] **Derive silently ignores `#[serde(field_identifier)]` /
-  `#[serde(variant_identifier)]`** (`carbonite-derive/src/lib.rs`,
-  `skip_meta`). These change the wire shape wholesale, so the derived schema
-  is confidently wrong. Reject them explicitly, like `untagged` / `flatten` /
-  `with`.
-- [ ] **The two engines diverge on hostile `Duration` bytes**: the columnar
-  path rejects `nanos >= 1e9` (`src/columnar.rs`) while std's serde impl
-  carries the overflow into seconds. No legitimate writer produces this;
-  either document the asymmetry or carry in the columnar path too.
-- [ ] **`ColMap::next_value_seed` uses `debug_assert!`** (`src/de.rs`) where
-  the serializing twin (`MapSerializer`, `src/ser.rs`) returns proper errors;
-  in release a misbehaving visitor silently desyncs cursors. Return an error
-  for symmetry.
-- [ ] **Hand-written `Deserialize` impls supporting `visit_map` but not
-  `visit_seq`** trace fine, match their own schema, get the fast positional
-  path — then fail where the slow path would work. Add a sentence to the
-  `Deserializer::new` docs pointing at `new_untraced`.
+- [x] **Derive silently ignores `#[serde(field_identifier)]` /
+  `#[serde(variant_identifier)]`**: now rejected at compile time with an
+  error explaining that an identifier type deserializes from another type's
+  names, so a schema would misdescribe it.
+- [x] **The two engines diverge on hostile `Duration` bytes**: the columnar
+  path now carries overflowing nanoseconds into the seconds exactly as std's
+  serde impl does (erroring only when the carry cannot fit). Parity test:
+  `the_two_engines_agree_on_overflowing_duration_nanoseconds`.
+- [x] **`ColMap::next_value_seed` uses `debug_assert!`**: now returns an
+  error, matching the write side's handling of the same visitor misuse.
+- [x] **Hand-written `Deserialize` impls supporting `visit_map` but not
+  `visit_seq`**: `Deserializer::new` now documents that the fast path is
+  positional and points such types at `new_untraced`.
 
 ## 5. API design
 

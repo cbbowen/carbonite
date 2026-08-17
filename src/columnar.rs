@@ -859,8 +859,12 @@ impl<'de> DeserializeColumns<'de> for std::time::Duration {
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         let secs = u64::from_le_bytes(cursors[0].fixed()?);
         let nanos = u32::from_le_bytes(cursors[1].fixed()?);
-        if nanos >= 1_000_000_000 {
-            return Err(Error::Malformed("Duration nanoseconds out of range"));
+        // std's serde impl carries overflowing nanoseconds into the seconds
+        // (after checking the carry fits), so the fast path accepts exactly
+        // the bytes the serde path does — no writer produces them, but the
+        // two engines must agree on every input.
+        if secs.checked_add(u64::from(nanos / 1_000_000_000)).is_none() {
+            return Err(Error::Message("overflow deserializing Duration".to_owned()));
         }
         Ok(std::time::Duration::new(secs, nanos))
     }

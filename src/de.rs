@@ -70,6 +70,12 @@ impl<T> Deserializer<T> {
     /// since that path can still decode the blob. [`Self::uses_fast_path`]
     /// reports which one was chosen; [`Schema::new`] surfaces the underlying
     /// tracing error if you want to see it.
+    ///
+    /// The fast path hands structs to the visitor *positionally*
+    /// (`visit_seq`), which every derived `Deserialize` accepts. A
+    /// hand-written impl whose visitor only accepts maps will trace
+    /// successfully and then reject the sequence; give such a type
+    /// [`Self::new_untraced`], which always uses the name-matched path.
     #[must_use]
     pub fn new(schema: Schema<T>) -> Self
     where
@@ -1374,7 +1380,13 @@ impl<'de> MapAccess<'de> for ColMap<'_, '_, 'de> {
     }
 
     fn next_value_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<S::Value> {
-        debug_assert!(self.awaiting_value, "value requested before key");
+        // A misbehaving visitor must get an error, not silently desynced
+        // cursors — the write side reports the same misuse the same way.
+        if !self.awaiting_value {
+            return Err(Error::Message(
+                "map value requested without a key".to_owned(),
+            ));
+        }
         self.awaiting_value = false;
         seed.deserialize(ValueDeserializer {
             node: self.value,

@@ -1136,6 +1136,14 @@ fn parse_container_attrs(attrs: &[syn::Attribute]) -> syn::Result<ContainerAttrs
                 out.de_repr = Some(parse_conversion(&meta, attr)?);
             } else if meta.path.is_ident("into") {
                 out.ser_repr = Some(parse_conversion(&meta, "into")?);
+            } else if meta.path.is_ident("field_identifier")
+                || meta.path.is_ident("variant_identifier")
+            {
+                return Err(meta.error(
+                    "carbonite cannot derive Schema for a serde identifier type: it deserializes \
+                     from the names of another type's fields or variants rather than from data of \
+                     its own, so a schema would misdescribe it",
+                ));
             } else if meta.path.is_ident("remote") {
                 return Err(meta.error(
                     "carbonite cannot derive Schema for serde(remote): the generated code is a \
