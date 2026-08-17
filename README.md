@@ -25,6 +25,8 @@ self-describing format with the size and speed of a binary one:
   parity on deserialization.
 - **Identity-aware**: `Shared<T>`/`SharedArc<T>` write each unique `Rc`/`Arc` object once
   and rebuild real pointer sharing on read.
+- **Safe on untrusted input**: every count a blob claims is validated against the bytes it
+  actually carries, so decoding work stays proportional to the input.
 
 ## Quick start
 
@@ -78,7 +80,7 @@ let blob = batch.finish();
 // Receiver: rebuild the schema, decode any number of blobs.
 let received = Schema::<Reading>::from_bytes(&schema_bytes).unwrap();
 let de = Deserializer::new_static(received);
-let back: Vec<Reading> = de.rows(&blob).unwrap().collect::<Result<_, _>>().unwrap();
+let back: Vec<Reading> = de.rows_columns(&blob).unwrap().collect::<Result<_, _>>().unwrap();
 assert_eq!(back, readings);
 ```
 
@@ -150,10 +152,12 @@ Two interchangeable engines produce and consume identical bytes:
 | | serde-driven | columnar (`#[derive(Schema)]`) |
 |---|---|---|
 | write | any `Serialize` type | `to_vec_columns` / `push_columns`, monomorphized |
-| read | **any schema** — this is the evolution path | exact-schema fast path, `from_slice_columns` |
+| read | **any schema** — this is the evolution path | exact-schema fast path, `from_slice_columns` / `rows_columns` |
 
 Serialization always targets the current schema, so the columnar writer is the default
 choice; the serde reader takes over whenever the file's schema differs from the type's.
+`carbonite::to_vec_static` / `from_slice_static` are the self-describing one-shots that
+take the fast path without a tracing pass.
 
 ## Limitations
 
@@ -164,7 +168,23 @@ and fail with clear errors (the same class of restriction as bincode/postcard):
 rejected. Adding a field requires `#[serde(default)]` to read old data. Shared-value
 dedup is per row and per field position; cyclic values error on read.
 
-carbonite is an experiment — the wire format may change between versions.
+## Compatibility and untrusted input
+
+The wire format is versioned in two places: `SCHEMA_VERSION` leads every `Schema::to_bytes`,
+and `FORMAT_VERSION` leads every self-describing frame. carbonite reads every version up to
+and including the ones it declares, and rejects newer ones with `Error::UnsupportedVersion`
+rather than misreading them. **Blobs written from this release forward will stay readable.**
+
+Deserialization treats every blob as hostile. The header's row count and every length inside
+the data are validated against the bytes actually present before they size an allocation or
+drive a loop; schemas are depth-limited; varints must be canonically encoded. Malformed input
+produces an `Error`, never a panic, an abort, or an unbounded allocation. The one count the
+data cannot bound is a repetition of a value that occupies no columns — `Vec<()>` and friends,
+which encode nothing per element — so those are capped at `MAX_ZERO_COLUMN_REPEAT`.
+
+Blob bytes are canonical for a given value, with one exception: `HashMap`/`HashSet` serialize
+in iteration order, which varies between runs. Use `BTreeMap`/`BTreeSet` where reproducible
+bytes matter.
 
 ## License
 

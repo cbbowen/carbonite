@@ -16,6 +16,11 @@ pub(crate) fn write(out: &mut Vec<u8>, mut value: u64) {
 }
 
 /// Reads a varint from the front of `buf`, returning the value and bytes consumed.
+///
+/// Only the canonical (shortest) encoding of a value is accepted: an overlong
+/// form such as `[0x80, 0x00]` for zero is rejected as [`Error::InvalidVarint`].
+/// That keeps a blob's bytes uniquely determined by its contents, so decoding
+/// and re-encoding reproduces the input exactly.
 pub(crate) fn read(buf: &[u8]) -> Result<(u64, usize)> {
     let mut value = 0u64;
     let mut shift = 0u32;
@@ -26,6 +31,11 @@ pub(crate) fn read(buf: &[u8]) -> Result<(u64, usize)> {
         }
         value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
+            // A continuation byte that adds nothing means a shorter encoding
+            // of the same value exists.
+            if i > 0 && byte == 0 {
+                return Err(Error::InvalidVarint);
+            }
             return Ok((value, i + 1));
         }
         shift += 7;
@@ -80,5 +90,31 @@ mod tests {
         let mut buf = vec![0xffu8; 9];
         buf.push(0x02);
         assert!(matches!(read(&buf), Err(Error::InvalidVarint)));
+    }
+
+    #[test]
+    fn rejects_non_canonical_encodings() {
+        // Zero padded out to two, three, and ten bytes.
+        assert!(matches!(read(&[0x80, 0x00]), Err(Error::InvalidVarint)));
+        assert!(matches!(read(&[0x80, 0x80, 0x00]), Err(Error::InvalidVarint)));
+        let mut buf = vec![0x80u8; 9];
+        buf.push(0x00);
+        assert!(matches!(read(&buf), Err(Error::InvalidVarint)));
+        // A padded small value, and a padded multi-byte value.
+        assert!(matches!(read(&[0x85, 0x00]), Err(Error::InvalidVarint)));
+        assert!(matches!(read(&[0xff, 0xff, 0x00]), Err(Error::InvalidVarint)));
+        // The canonical forms of the same values still read.
+        assert_eq!(read(&[0x00]).unwrap(), (0, 1));
+        assert_eq!(read(&[0x05]).unwrap(), (5, 1));
+        assert_eq!(read(&[0xff, 0x7f]).unwrap(), (16_383, 2));
+    }
+
+    #[test]
+    fn every_written_value_reads_back_canonically() {
+        for value in [0u64, 1, 127, 128, 16_383, 16_384, u32::MAX as u64, u64::MAX] {
+            let mut buf = Vec::new();
+            write(&mut buf, value);
+            assert_eq!(read(&buf).unwrap(), (value, buf.len()));
+        }
     }
 }

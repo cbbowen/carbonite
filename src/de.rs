@@ -9,13 +9,17 @@
 //! `#[serde(default)]` or report `missing field`, and `#[serde(alias)]`
 //! works.
 
+use std::fmt;
+use std::iter::FusedIterator;
+use std::marker::PhantomData;
+
 use serde::de::value::StrDeserializer;
 use serde::de::{
     self, Deserialize, DeserializeOwned, DeserializeSeed, EnumAccess, MapAccess, SeqAccess,
     VariantAccess, Visitor,
 };
 
-use crate::columnar::{ColumnCursor as Cursor, DeserializeColumns};
+use crate::columnar::{ColumnCursor as Cursor, DeserializeColumns, checked_count};
 use crate::error::{Error, Result};
 use crate::layout::{LNode, Layout};
 use crate::schema::{Primitive, Schema, SchemaNode, VariantNode};
@@ -24,16 +28,40 @@ use crate::schema::{Primitive, Schema, SchemaNode, VariantNode};
 ///
 /// The schema passed in is the **writer's** schema — possibly from an older
 /// version of `T`. One `Deserializer` can decode any number of blobs.
+///
+/// # Untrusted input
+///
+/// Every blob is treated as hostile: the header's row count and every length
+/// inside the data are validated against the bytes actually present before
+/// they size an allocation or drive a loop, so decoding work stays
+/// proportional to the input. Malformed input yields an [`Error`], never a
+/// panic or an unbounded allocation.
 pub struct Deserializer<T: ?Sized> {
     schema: Schema<T>,
     layout: Layout,
     fast: bool,
 }
 
+impl<T: ?Sized> fmt::Debug for Deserializer<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Deserializer")
+            .field("schema", &format_args!("{}", self.schema))
+            .field("columns", &self.layout.columns)
+            .field("fast_path", &self.fast)
+            .finish()
+    }
+}
+
 impl<T> Deserializer<T> {
     /// Builds a deserializer, tracing `T` to detect whether the fast
     /// positional path can be used (it can whenever the writer's schema is
     /// identical to `T`'s own).
+    ///
+    /// If `T` cannot be traced at all — an untagged enum, a `flatten`ed
+    /// field — this falls back to the name-matched path rather than failing,
+    /// since that path can still decode the blob. [`Self::uses_fast_path`]
+    /// reports which one was chosen; [`Schema::new`] surfaces the underlying
+    /// tracing error if you want to see it.
     #[must_use]
     pub fn new(schema: Schema<T>) -> Self
     where
@@ -66,7 +94,7 @@ impl<T: ?Sized> Deserializer<T> {
         Self::build(schema, false)
     }
 
-    fn build(schema: Schema<T>, fast: bool) -> Self {
+    pub(crate) fn build(schema: Schema<T>, fast: bool) -> Self {
         let layout = Layout::new(schema.node());
         Deserializer {
             schema,
@@ -79,6 +107,16 @@ impl<T: ?Sized> Deserializer<T> {
     #[must_use]
     pub fn schema(&self) -> &Schema<T> {
         &self.schema
+    }
+
+    /// Whether the writer's schema matched `T`'s own, so rows decode
+    /// positionally instead of by field name.
+    ///
+    /// `false` means the blob is being reconciled against `T` — an older
+    /// file, a foreign writer, or a `T` that could not be traced.
+    #[must_use]
+    pub fn uses_fast_path(&self) -> bool {
+        self.fast
     }
 
     /// Deserializes a single-value blob (as produced by
@@ -96,7 +134,8 @@ impl<T: ?Sized> Deserializer<T> {
         if rows.remaining() != 1 {
             return Err(Error::Malformed("expected a single-value blob"));
         }
-        rows.next().expect("one row remains")
+        rows.next()
+            .ok_or(Error::Malformed("expected a single-value blob"))?
     }
 
     /// Opens a blob and iterates its rows (as produced by
@@ -132,43 +171,66 @@ impl<T: ?Sized> Deserializer<T> {
     where
         T: DeserializeColumns<'de>,
     {
+        let mut rows = self.rows_columns(input)?;
+        if rows.remaining() != 1 {
+            return Err(Error::Malformed("expected a single-value blob"));
+        }
+        rows.next()
+            .ok_or(Error::Malformed("expected a single-value blob"))?
+    }
+
+    /// Opens a blob and iterates its rows through the monomorphized columnar
+    /// fast path from `#[derive(Schema)]` — the reading counterpart of
+    /// [`Batch::push_columns`](crate::Batch::push_columns).
+    ///
+    /// Like [`Self::from_slice_columns`], this path cannot reconcile schema
+    /// differences: it requires the blob's schema to equal the type's own
+    /// [`StaticSchema`](crate::StaticSchema). For older or foreign schemas,
+    /// use [`Self::rows`].
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::SchemaMismatch`] when the schema differs from the
+    /// type's, or if the header is malformed.
+    pub fn rows_columns<'de>(&self, input: &'de [u8]) -> Result<RowsColumns<'de, T>>
+    where
+        T: DeserializeColumns<'de>,
+    {
         if !self.fast && T::schema_node() != *self.schema.node() {
             return Err(columnar_schema_mismatch());
         }
-        let (row_count, mut cursors) = self.open(input)?;
-        if row_count != 1 {
-            return Err(Error::Malformed("expected a single-value blob"));
-        }
-        let _shared_scope = crate::shared::RowScope::begin();
-        let value = T::deserialize_columns(&mut cursors)?;
-        if !cursors.iter().all(Cursor::at_end) {
-            return Err(Error::TrailingBytes);
-        }
-        Ok(value)
+        let (row_count, cursors) = self.open(input)?;
+        Ok(RowsColumns {
+            cursors,
+            remaining: row_count,
+            _marker: PhantomData,
+        })
     }
 
     /// Parses the blob header and slices one cursor per column.
     fn open<'de>(&self, input: &'de [u8]) -> Result<(u64, Vec<Cursor<'de>>)> {
-        let mut header = Cursor { buf: input, pos: 0 };
+        let mut header = Cursor::new(input);
         let row_count = header.varint()?;
         let column_count = header.varint()?;
         if column_count != self.layout.columns as u64 {
             return Err(Error::Malformed("column count does not match schema"));
         }
-        let mut lengths = Vec::with_capacity(self.layout.columns);
+        let mut lengths = Vec::with_capacity(self.layout.columns.min(1024));
         for _ in 0..self.layout.columns {
             lengths.push(header.varint_len()?);
         }
         let mut cursors = Vec::with_capacity(lengths.len());
         for length in lengths {
-            cursors.push(Cursor {
-                buf: header.take(length)?,
-                pos: 0,
-            });
+            cursors.push(Cursor::new(header.take(length)?));
         }
         if !header.at_end() {
             return Err(Error::TrailingBytes);
         }
+        // A row occupying at least one column writes at least one byte, so
+        // the column bytes bound how many rows the header can legitimately
+        // claim. Without this a tampered count drives an unbounded
+        // allocation in any consumer that trusts it.
+        checked_count("row count", self.layout.columns, row_count, &cursors)?;
         Ok((row_count, cursors))
     }
 }
@@ -190,8 +252,20 @@ pub struct Rows<'a, 'de, T: ?Sized> {
     remaining: u64,
 }
 
+impl<T: ?Sized> fmt::Debug for Rows<'_, '_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rows")
+            .field("remaining", &self.remaining)
+            .field("columns", &self.cursors.len())
+            .finish()
+    }
+}
+
 impl<T: ?Sized> Rows<'_, '_, T> {
     /// Rows not yet read.
+    ///
+    /// The blob header is validated against the bytes present when the blob
+    /// is opened, so this count cannot exceed what the input could hold.
     #[must_use]
     pub fn remaining(&self) -> u64 {
         self.remaining
@@ -229,11 +303,76 @@ where
         Some(result)
     }
 
+    /// The lower bound is always `0`: the header's row count says how many
+    /// rows the blob *claims*, but any of them may fail to decode, and a
+    /// consumer must never size an allocation from a number the input has
+    /// not yet earned.
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = usize::try_from(self.remaining).ok();
-        (n.unwrap_or(usize::MAX), n)
+        (0, usize::try_from(self.remaining).ok())
     }
 }
+
+impl<'de, T> FusedIterator for Rows<'_, 'de, T> where T: Deserialize<'de> {}
+
+/// Iterator over the rows of one blob, decoded through the monomorphized
+/// columnar fast path. See [`Deserializer::rows_columns`].
+///
+/// After an error, iteration fuses (yields `None`).
+pub struct RowsColumns<'de, T: ?Sized> {
+    cursors: Vec<Cursor<'de>>,
+    remaining: u64,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<T: ?Sized> fmt::Debug for RowsColumns<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RowsColumns")
+            .field("remaining", &self.remaining)
+            .field("columns", &self.cursors.len())
+            .finish()
+    }
+}
+
+impl<T: ?Sized> RowsColumns<'_, T> {
+    /// Rows not yet read.
+    #[must_use]
+    pub fn remaining(&self) -> u64 {
+        self.remaining
+    }
+}
+
+impl<'de, T> Iterator for RowsColumns<'de, T>
+where
+    T: DeserializeColumns<'de>,
+{
+    type Item = Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let _shared_scope = crate::shared::RowScope::begin();
+        let result = T::deserialize_columns(&mut self.cursors).and_then(|value| {
+            // The last row must consume every column exactly.
+            if self.remaining == 0 && !self.cursors.iter().all(Cursor::at_end) {
+                return Err(Error::TrailingBytes);
+            }
+            Ok(value)
+        });
+        if result.is_err() {
+            self.remaining = 0;
+        }
+        Some(result)
+    }
+
+    /// As with [`Rows`], the lower bound is `0` until a row actually decodes.
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, usize::try_from(self.remaining).ok())
+    }
+}
+
+impl<'de, T> FusedIterator for RowsColumns<'de, T> where T: DeserializeColumns<'de> {}
 
 fn key_deserializer(key: &str) -> StrDeserializer<'_, Error> {
     StrDeserializer::new(key)
@@ -323,8 +462,17 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                     }),
                 }
             }
-            (SchemaNode::Seq(elem), LNode::Seq { len, elem: lelem }) => {
-                let remaining = self.cursors[*len].varint()?;
+            (
+                SchemaNode::Seq(elem),
+                LNode::Seq {
+                    len,
+                    elem: lelem,
+                    elem_columns,
+                },
+            ) => {
+                let claimed = self.cursors[*len].varint()?;
+                let remaining =
+                    checked_count("sequence length", *elem_columns, claimed, self.cursors)? as u64;
                 visitor.visit_seq(ColSeq {
                     node: elem,
                     lnode: lelem,
@@ -355,9 +503,12 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                     len,
                     key: lkey,
                     value: lvalue,
+                    entry_columns,
                 },
             ) => {
-                let remaining = self.cursors[*len].varint()?;
+                let claimed = self.cursors[*len].varint()?;
+                let remaining =
+                    checked_count("map length", *entry_columns, claimed, self.cursors)? as u64;
                 visitor.visit_map(ColMap {
                     key,
                     lkey,
@@ -465,8 +616,16 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                     }
                 }
             }
-            (SchemaNode::Seq(elem), LNode::Seq { len, elem: lelem }) => {
-                let n = cursors[*len].varint()?;
+            (
+                SchemaNode::Seq(elem),
+                LNode::Seq {
+                    len,
+                    elem: lelem,
+                    elem_columns,
+                },
+            ) => {
+                let claimed = cursors[*len].varint()?;
+                let n = checked_count("sequence length", *elem_columns, claimed, cursors)?;
                 for _ in 0..n {
                     Self::skip(elem, lelem, cursors)?;
                 }
@@ -477,9 +636,11 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                     len,
                     key: lkey,
                     value: lvalue,
+                    entry_columns,
                 },
             ) => {
-                let n = cursors[*len].varint()?;
+                let claimed = cursors[*len].varint()?;
+                let n = checked_count("map length", *entry_columns, claimed, cursors)?;
                 for _ in 0..n {
                     Self::skip(key, lkey, cursors)?;
                     Self::skip(value, lvalue, cursors)?;

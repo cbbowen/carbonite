@@ -123,6 +123,18 @@ fn rename_attributes_match_trace() {
         home_address_line: Option<String>,
     }
 
+    // serde's snake_case rule splits on any Unicode uppercase, not just
+    // ASCII, so a non-ASCII capital mid-identifier is where a replica of the
+    // rule most easily drifts out of step with the real thing.
+    #[derive(Serialize, Deserialize, carbonite::Schema)]
+    #[serde(rename_all = "snake_case")]
+    #[allow(dead_code, non_camel_case_types)]
+    enum Units {
+        MetresPerSecond,
+        AÉrogare,
+        Watt,
+    }
+
     #[derive(Serialize, Deserialize, carbonite::Schema)]
     #[serde(rename_all = "SCREAMING-KEBAB-CASE")]
     #[allow(dead_code)]
@@ -149,6 +161,7 @@ fn rename_attributes_match_trace() {
 
     assert_matches_trace::<Renamed>();
     assert_matches_trace::<Screaming>();
+    assert_matches_trace::<Units>();
     assert_matches_trace::<HttpEvent>();
 }
 
@@ -255,6 +268,6 @@ fn borrowing_types_get_the_static_fast_path() {
     let framed = carbonite::SelfDescribingSerializer::new(&schema)
         .to_vec(&value)
         .unwrap();
-    let back: LogLine = carbonite::SelfDescribingDeserializer::from_slice_static(&framed).unwrap();
+    let back: LogLine = carbonite::from_slice_static(&framed).unwrap();
     assert_eq!(back, value);
 }

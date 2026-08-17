@@ -15,6 +15,12 @@ use crate::schema::{Primitive, Schema, SchemaNode, VariantNode};
 /// derive just skips the runtime cost and, unlike tracing, also works for
 /// types that borrow from their input.
 ///
+/// [`StaticSchema::schema`] is the method you call. The rest of the trait —
+/// the schema tree and the column-layout constants — is carbonite's internal
+/// surface, shared by the [`SerializeColumns`](crate::SerializeColumns) and
+/// [`DeserializeColumns`](crate::DeserializeColumns) fast paths so the two
+/// directions can never disagree about a type's layout.
+///
 /// # Examples
 ///
 /// ```
@@ -33,8 +39,19 @@ use crate::schema::{Primitive, Schema, SchemaNode, VariantNode};
 /// # Ok::<(), carbonite::Error>(())
 /// ```
 pub trait StaticSchema {
-    /// The untyped schema tree for this type.
+    /// The untyped schema tree for this type. Internal; see
+    /// [`SchemaNode`].
+    #[doc(hidden)]
     fn schema_node() -> SchemaNode;
+
+    /// Number of columns this type's schema occupies. Internal.
+    #[doc(hidden)]
+    const COLUMNS: usize;
+
+    /// `Some(width)` iff this type is a single fixed-width column, which lets
+    /// sequences bulk-reserve. Internal.
+    #[doc(hidden)]
+    const FIXED_WIDTH: Option<usize> = None;
 
     /// The typed schema for this type.
     #[must_use]
@@ -44,69 +61,75 @@ pub trait StaticSchema {
 }
 
 macro_rules! primitive_impls {
-    ($($ty:ty => $prim:ident,)*) => {$(
+    ($($ty:ty => $prim:ident, $width:expr;)*) => {$(
         impl StaticSchema for $ty {
             fn schema_node() -> SchemaNode {
                 SchemaNode::Primitive(Primitive::$prim)
             }
+            const COLUMNS: usize = 1;
+            const FIXED_WIDTH: Option<usize> = Some($width);
         }
     )*};
 }
 
 primitive_impls! {
-    bool => Bool,
-    i8 => I8,
-    i16 => I16,
-    i32 => I32,
-    i64 => I64,
-    i128 => I128,
+    bool => Bool, 1;
+    i8 => I8, 1;
+    i16 => I16, 2;
+    i32 => I32, 4;
+    i64 => I64, 8;
+    i128 => I128, 16;
     // serde puts usize/isize on the wire as u64/i64.
-    isize => I64,
-    u8 => U8,
-    u16 => U16,
-    u32 => U32,
-    u64 => U64,
-    u128 => U128,
-    usize => U64,
-    f32 => F32,
-    f64 => F64,
-    char => Char,
-    std::num::NonZeroI8 => I8,
-    std::num::NonZeroI16 => I16,
-    std::num::NonZeroI32 => I32,
-    std::num::NonZeroI64 => I64,
-    std::num::NonZeroI128 => I128,
-    std::num::NonZeroIsize => I64,
-    std::num::NonZeroU8 => U8,
-    std::num::NonZeroU16 => U16,
-    std::num::NonZeroU32 => U32,
-    std::num::NonZeroU64 => U64,
-    std::num::NonZeroU128 => U128,
-    std::num::NonZeroUsize => U64,
+    isize => I64, 8;
+    u8 => U8, 1;
+    u16 => U16, 2;
+    u32 => U32, 4;
+    u64 => U64, 8;
+    u128 => U128, 16;
+    usize => U64, 8;
+    f32 => F32, 4;
+    f64 => F64, 8;
+    char => Char, 4;
+    std::num::NonZeroI8 => I8, 1;
+    std::num::NonZeroI16 => I16, 2;
+    std::num::NonZeroI32 => I32, 4;
+    std::num::NonZeroI64 => I64, 8;
+    std::num::NonZeroI128 => I128, 16;
+    std::num::NonZeroIsize => I64, 8;
+    std::num::NonZeroU8 => U8, 1;
+    std::num::NonZeroU16 => U16, 2;
+    std::num::NonZeroU32 => U32, 4;
+    std::num::NonZeroU64 => U64, 8;
+    std::num::NonZeroU128 => U128, 16;
+    std::num::NonZeroUsize => U64, 8;
 }
 
 impl StaticSchema for () {
     fn schema_node() -> SchemaNode {
         SchemaNode::Unit
     }
+    const COLUMNS: usize = 0;
 }
 
 impl StaticSchema for String {
     fn schema_node() -> SchemaNode {
         SchemaNode::String
     }
+    const COLUMNS: usize = 2;
 }
 
 impl StaticSchema for str {
     fn schema_node() -> SchemaNode {
         SchemaNode::String
     }
+    const COLUMNS: usize = 2;
 }
 
 impl<T: StaticSchema> StaticSchema for Option<T> {
     fn schema_node() -> SchemaNode {
         SchemaNode::Option(Box::new(T::schema_node()))
     }
+    const COLUMNS: usize = 1 + T::COLUMNS;
 }
 
 macro_rules! seq_impls {
@@ -115,6 +138,7 @@ macro_rules! seq_impls {
             fn schema_node() -> SchemaNode {
                 SchemaNode::Seq(Box::new(T::schema_node()))
             }
+            const COLUMNS: usize = 1 + T::COLUMNS;
         }
     )*};
 }
@@ -131,6 +155,7 @@ impl<T: StaticSchema, S> StaticSchema for HashSet<T, S> {
     fn schema_node() -> SchemaNode {
         SchemaNode::Seq(Box::new(T::schema_node()))
     }
+    const COLUMNS: usize = 1 + T::COLUMNS;
 }
 
 impl<T: StaticSchema, const N: usize> StaticSchema for [T; N] {
@@ -138,6 +163,7 @@ impl<T: StaticSchema, const N: usize> StaticSchema for [T; N] {
         // serde treats arrays as N-tuples.
         SchemaNode::Tuple(vec![T::schema_node(); N])
     }
+    const COLUMNS: usize = N * T::COLUMNS;
 }
 
 impl<K: StaticSchema, V: StaticSchema, S> StaticSchema for HashMap<K, V, S> {
@@ -147,6 +173,7 @@ impl<K: StaticSchema, V: StaticSchema, S> StaticSchema for HashMap<K, V, S> {
             value: Box::new(V::schema_node()),
         }
     }
+    const COLUMNS: usize = 1 + K::COLUMNS + V::COLUMNS;
 }
 
 impl<K: StaticSchema, V: StaticSchema> StaticSchema for BTreeMap<K, V> {
@@ -156,6 +183,7 @@ impl<K: StaticSchema, V: StaticSchema> StaticSchema for BTreeMap<K, V> {
             value: Box::new(V::schema_node()),
         }
     }
+    const COLUMNS: usize = 1 + K::COLUMNS + V::COLUMNS;
 }
 
 macro_rules! tuple_impls {
@@ -164,6 +192,7 @@ macro_rules! tuple_impls {
             fn schema_node() -> SchemaNode {
                 SchemaNode::Tuple(vec![$(<$name>::schema_node()),+])
             }
+            const COLUMNS: usize = 0 $(+ $name::COLUMNS)+;
         }
     )*};
 }
@@ -187,40 +216,26 @@ tuple_impls! {
     T0 T1 T2 T3 T4 T5 T6 T7 T8 T9 T10 T11 T12 T13 T14 T15,
 }
 
-impl<T: StaticSchema + ?Sized> StaticSchema for &T {
-    fn schema_node() -> SchemaNode {
-        T::schema_node()
-    }
+macro_rules! transparent_impls {
+    ($($ty:ty),* $(,)?) => {$(
+        impl<T: StaticSchema + ?Sized> StaticSchema for $ty {
+            fn schema_node() -> SchemaNode {
+                T::schema_node()
+            }
+            const COLUMNS: usize = T::COLUMNS;
+            const FIXED_WIDTH: Option<usize> = T::FIXED_WIDTH;
+        }
+    )*};
 }
 
-impl<T: StaticSchema + ?Sized> StaticSchema for &mut T {
-    fn schema_node() -> SchemaNode {
-        T::schema_node()
-    }
-}
-
-impl<T: StaticSchema + ?Sized> StaticSchema for Box<T> {
-    fn schema_node() -> SchemaNode {
-        T::schema_node()
-    }
-}
-
-impl<T: StaticSchema + ?Sized> StaticSchema for std::rc::Rc<T> {
-    fn schema_node() -> SchemaNode {
-        T::schema_node()
-    }
-}
-
-impl<T: StaticSchema + ?Sized> StaticSchema for std::sync::Arc<T> {
-    fn schema_node() -> SchemaNode {
-        T::schema_node()
-    }
-}
+transparent_impls!(&T, &mut T, Box<T>, std::rc::Rc<T>, std::sync::Arc<T>);
 
 impl<T: StaticSchema + ToOwned + ?Sized> StaticSchema for Cow<'_, T> {
     fn schema_node() -> SchemaNode {
         T::schema_node()
     }
+    const COLUMNS: usize = T::COLUMNS;
+    const FIXED_WIDTH: Option<usize> = T::FIXED_WIDTH;
 }
 
 impl<T: StaticSchema, E: StaticSchema> StaticSchema for Result<T, E> {
@@ -239,6 +254,7 @@ impl<T: StaticSchema, E: StaticSchema> StaticSchema for Result<T, E> {
             ],
         }
     }
+    const COLUMNS: usize = 1 + T::COLUMNS + E::COLUMNS;
 }
 
 impl<T: ?Sized> StaticSchema for PhantomData<T> {
@@ -248,6 +264,7 @@ impl<T: ?Sized> StaticSchema for PhantomData<T> {
             name: "PhantomData".to_owned(),
         }
     }
+    const COLUMNS: usize = 0;
 }
 
 impl StaticSchema for std::time::Duration {
@@ -260,6 +277,7 @@ impl StaticSchema for std::time::Duration {
             ],
         }
     }
+    const COLUMNS: usize = 2;
 }
 
 impl StaticSchema for std::time::SystemTime {
@@ -277,5 +295,63 @@ impl StaticSchema for std::time::SystemTime {
                 ),
             ],
         }
+    }
+    const COLUMNS: usize = 2;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::Layout;
+
+    /// Every `StaticSchema::COLUMNS` must equal what the layout builder
+    /// derives from the same type's schema tree — the invariant the columnar
+    /// fast paths rely on for their compile-time column offsets.
+    fn assert_columns_agree<T: StaticSchema + ?Sized>() {
+        assert_eq!(
+            T::COLUMNS,
+            Layout::new(&T::schema_node()).columns,
+            "COLUMNS disagrees with the layout for {}",
+            std::any::type_name::<T>(),
+        );
+    }
+
+    #[test]
+    fn column_counts_match_the_layout() {
+        assert_columns_agree::<bool>();
+        assert_columns_agree::<u8>();
+        assert_columns_agree::<i128>();
+        assert_columns_agree::<char>();
+        assert_columns_agree::<usize>();
+        assert_columns_agree::<std::num::NonZeroU32>();
+        assert_columns_agree::<()>();
+        assert_columns_agree::<String>();
+        assert_columns_agree::<str>();
+        assert_columns_agree::<Option<u32>>();
+        assert_columns_agree::<Option<Option<String>>>();
+        assert_columns_agree::<Vec<u32>>();
+        assert_columns_agree::<Vec<(u32, String)>>();
+        assert_columns_agree::<VecDeque<u8>>();
+        assert_columns_agree::<LinkedList<u8>>();
+        assert_columns_agree::<BinaryHeap<u8>>();
+        assert_columns_agree::<BTreeSet<u8>>();
+        assert_columns_agree::<HashSet<u8>>();
+        assert_columns_agree::<[u32; 4]>();
+        assert_columns_agree::<[String; 3]>();
+        assert_columns_agree::<[(); 5]>();
+        assert_columns_agree::<HashMap<String, u32>>();
+        assert_columns_agree::<BTreeMap<u8, Vec<f32>>>();
+        assert_columns_agree::<(u8,)>();
+        assert_columns_agree::<(u8, String, Option<f64>)>();
+        assert_columns_agree::<&u32>();
+        assert_columns_agree::<&str>();
+        assert_columns_agree::<Box<Vec<u8>>>();
+        assert_columns_agree::<std::rc::Rc<String>>();
+        assert_columns_agree::<std::sync::Arc<u64>>();
+        assert_columns_agree::<Cow<'_, str>>();
+        assert_columns_agree::<Result<u32, String>>();
+        assert_columns_agree::<PhantomData<u8>>();
+        assert_columns_agree::<std::time::Duration>();
+        assert_columns_agree::<std::time::SystemTime>();
     }
 }

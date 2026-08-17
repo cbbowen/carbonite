@@ -36,11 +36,16 @@ pub(crate) enum LNode {
     Seq {
         len: ColId,
         elem: Box<LNode>,
+        /// Columns occupied by one element. Zero means an element consumes no
+        /// bytes, so a claimed length cannot be validated against the input.
+        elem_columns: usize,
     },
     Map {
         len: ColId,
         key: Box<LNode>,
         value: Box<LNode>,
+        /// Columns occupied by one key/value pair. See `Seq::elem_columns`.
+        entry_columns: usize,
     },
     /// Tuple, tuple struct, struct, tuple variant, or struct variant fields.
     Product(Vec<LNode>),
@@ -86,15 +91,28 @@ fn build(node: &SchemaNode, next: &mut usize) -> LNode {
             tag: alloc(next),
             inner: Box::new(build(inner, next)),
         },
-        SchemaNode::Seq(elem) => LNode::Seq {
-            len: alloc(next),
-            elem: Box::new(build(elem, next)),
-        },
-        SchemaNode::Map { key, value } => LNode::Map {
-            len: alloc(next),
-            key: Box::new(build(key, next)),
-            value: Box::new(build(value, next)),
-        },
+        SchemaNode::Seq(elem) => {
+            let len = alloc(next);
+            let before = *next;
+            let lelem = Box::new(build(elem, next));
+            LNode::Seq {
+                len,
+                elem: lelem,
+                elem_columns: *next - before,
+            }
+        }
+        SchemaNode::Map { key, value } => {
+            let len = alloc(next);
+            let before = *next;
+            let lkey = Box::new(build(key, next));
+            let lvalue = Box::new(build(value, next));
+            LNode::Map {
+                len,
+                key: lkey,
+                value: lvalue,
+                entry_columns: *next - before,
+            }
+        }
         SchemaNode::Tuple(fields) | SchemaNode::TupleStruct { fields, .. } => {
             LNode::Product(fields.iter().map(|field| build(field, next)).collect())
         }
@@ -143,10 +161,16 @@ mod tests {
         ])));
         let layout = Layout::new(&schema);
         assert_eq!(layout.columns, 3);
-        let LNode::Seq { len, elem } = &layout.root else {
+        let LNode::Seq {
+            len,
+            elem,
+            elem_columns,
+        } = &layout.root
+        else {
             panic!("expected seq layout");
         };
         assert_eq!(*len, 0);
+        assert_eq!(*elem_columns, 2);
         let LNode::Product(fields) = &**elem else {
             panic!("expected product layout");
         };

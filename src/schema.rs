@@ -3,7 +3,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Visitor};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -13,7 +13,18 @@ use crate::varint;
 /// types) and schema decoding (malicious input).
 pub(crate) const MAX_DEPTH: usize = 256;
 
+/// Version of carbonite's schema encoding, written as the first byte of
+/// [`Schema::to_bytes`].
+///
+/// carbonite commits to reading every schema version up to and including this
+/// one, so a `Schema` written by an older release stays readable. A schema
+/// declaring a *newer* version is rejected with
+/// [`Error::UnsupportedVersion`] rather than misinterpreted.
+pub const SCHEMA_VERSION: u64 = 1;
+
 /// A fixed-width primitive in the serde data model.
+#[doc(hidden)]
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Primitive {
     /// `bool`, one byte per value (`0` or `1`).
@@ -121,9 +132,13 @@ impl Primitive {
 /// An untyped description of how a value is laid out, mirroring the serde
 /// data model.
 ///
-/// `SchemaNode` derives `Serialize`/`Deserialize`, so a schema can be shipped
-/// through any serde format. For a stable binary form independent of other
-/// format crates, use [`SchemaNode::to_bytes`] / [`SchemaNode::from_bytes`].
+/// This is a carbonite implementation detail. It has to be reachable because
+/// `#[derive(Schema)]` constructs one, but it is not part of the supported
+/// surface: variants may be added, and the type is `#[non_exhaustive]`.
+/// Work with [`Schema<T>`] instead — it is what the public API accepts and
+/// what [`Schema::to_bytes`] versions.
+#[doc(hidden)]
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SchemaNode {
     /// A fixed-width primitive.
@@ -193,6 +208,10 @@ pub enum SchemaNode {
 }
 
 /// The shape of one enum variant.
+///
+/// A carbonite implementation detail; see [`SchemaNode`].
+#[doc(hidden)]
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VariantNode {
     /// A variant with no payload.
@@ -206,7 +225,8 @@ pub enum VariantNode {
 }
 
 impl SchemaNode {
-    /// A short human-readable description, used in error messages.
+    /// A short human-readable description, used in error messages and by
+    /// [`Schema`]'s `Display` impl.
     pub(crate) fn describe(&self) -> String {
         match self {
             SchemaNode::Primitive(p) => p.name().to_owned(),
@@ -226,22 +246,37 @@ impl SchemaNode {
         }
     }
 
-    /// Encodes this schema in carbonite's stable binary form.
+    /// Encodes this schema in carbonite's versioned binary form.
+    #[doc(hidden)]
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        varint::write(&mut out, SCHEMA_VERSION);
         self.encode_into(&mut out);
         out
     }
 
-    /// Decodes a schema from its stable binary form.
+    /// Decodes a schema from its versioned binary form.
     ///
     /// # Errors
     ///
-    /// Returns an error if the input is truncated, contains unknown tags,
-    /// nests deeper than the supported limit, or has trailing bytes.
+    /// Returns an error if the input declares a newer [`SCHEMA_VERSION`] than
+    /// this build supports, is truncated, contains unknown tags, nests deeper
+    /// than the supported limit, or has trailing bytes.
+    #[doc(hidden)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut pos = 0;
+        let (version, used) = varint::read(bytes)?;
+        if version == 0 {
+            return Err(Error::Malformed("invalid schema version"));
+        }
+        if version > SCHEMA_VERSION {
+            return Err(Error::UnsupportedVersion {
+                what: "schema",
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        let mut pos = used;
         let node = Self::decode(bytes, &mut pos, 0)?;
         if pos != bytes.len() {
             return Err(Error::TrailingBytes);
@@ -465,20 +500,25 @@ fn decode_str(buf: &[u8], pos: &mut usize) -> Result<String> {
     String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidUtf8)
 }
 
-/// A serializable description of how values of type `T` are serialized.
+/// A description of how values of type `T` are serialized.
 ///
 /// Obtain one with [`Schema::new`], which discovers the schema by tracing
 /// `T`'s [`Deserialize`] implementation — plain `#[derive(Serialize,
-/// Deserialize)]` types work as-is, with no extra derive.
+/// Deserialize)]` types work as-is, with no extra derive — or with
+/// [`StaticSchema::schema`](crate::StaticSchema::schema) when `T` carries
+/// `#[derive(Schema)]`.
 ///
-/// A `Schema` is itself serializable (via serde, or via the stable binary
-/// [`Schema::to_bytes`] form), so it can be sent once over a network and
-/// reused for any number of data blobs, or prepended to a file.
-#[derive(Serialize, Deserialize)]
-#[serde(transparent, bound(serialize = "", deserialize = ""))]
+/// A `Schema` can be shipped: [`Schema::to_bytes`] produces a versioned
+/// binary form that [`Schema::from_bytes`] reads back, so it can be sent once
+/// over a network and reused for any number of data blobs, or prepended to a
+/// file. Its `Serialize`/`Deserialize` impls carry that same versioned form,
+/// so a schema routed through another serde format stays version-tagged.
+///
+/// The schema tree itself is a carbonite implementation detail. `Schema`
+/// exposes what you can rely on: equality (does this blob match my type?),
+/// `Display` (what shape is this?), and the byte form.
 pub struct Schema<T: ?Sized> {
     root: SchemaNode,
-    #[serde(skip)]
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -503,7 +543,9 @@ impl<T: ?Sized> Schema<T> {
     /// Wraps an untyped schema tree as the schema for `T`.
     ///
     /// The caller asserts that the tree matches how `T` serializes (or an
-    /// older, field-compatible version of it).
+    /// older, field-compatible version of it). Part of carbonite's internal
+    /// surface; see [`SchemaNode`].
+    #[doc(hidden)]
     #[must_use]
     pub fn from_node(root: SchemaNode) -> Self {
         Schema {
@@ -512,31 +554,113 @@ impl<T: ?Sized> Schema<T> {
         }
     }
 
-    /// The untyped schema tree.
+    /// The untyped schema tree. Internal; see [`SchemaNode`].
+    #[doc(hidden)]
     #[must_use]
     pub fn node(&self) -> &SchemaNode {
         &self.root
     }
 
-    /// Consumes the schema, returning the untyped tree.
+    /// Consumes the schema, returning the untyped tree. Internal; see
+    /// [`SchemaNode`].
+    #[doc(hidden)]
     #[must_use]
     pub fn into_node(self) -> SchemaNode {
         self.root
     }
 
-    /// Encodes the schema in carbonite's stable binary form.
+    /// Reinterprets this schema as the schema for a different type.
+    ///
+    /// Use this to read a blob written by an older version of a type into its
+    /// current version: the schema describes the *writer*, and the reader
+    /// reconciles it against `U` by field name. The caller asserts nothing —
+    /// any mismatch surfaces as an ordinary deserialization error.
+    #[must_use]
+    pub fn cast<U: ?Sized>(self) -> Schema<U> {
+        Schema {
+            root: self.root,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Encodes the schema in carbonite's versioned binary form, beginning
+    /// with [`SCHEMA_VERSION`].
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         self.root.to_bytes()
     }
 
-    /// Decodes a schema from its stable binary form.
+    /// Decodes a schema from the form produced by [`Schema::to_bytes`].
     ///
     /// # Errors
     ///
-    /// See [`SchemaNode::from_bytes`].
+    /// [`Error::UnsupportedVersion`] if the bytes were written by a newer
+    /// carbonite, and [`Error::Malformed`] / [`Error::UnexpectedEof`] /
+    /// [`Error::DepthLimitExceeded`] / [`Error::TrailingBytes`] on damaged or
+    /// hostile input.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         Ok(Self::from_node(SchemaNode::from_bytes(bytes)?))
+    }
+}
+
+impl<T: ?Sized> Serialize for Schema<T> {
+    /// Serializes the versioned byte form, so a schema routed through another
+    /// serde format carries the same version marker as [`Schema::to_bytes`].
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.to_bytes())
+    }
+}
+
+impl<'de, T: ?Sized> Deserialize<'de> for Schema<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct BytesVisitor;
+
+        impl<'de> Visitor<'de> for BytesVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a carbonite schema in its binary form")
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> std::result::Result<Vec<u8>, E> {
+                Ok(v.to_vec())
+            }
+
+            fn visit_byte_buf<E: serde::de::Error>(
+                self,
+                v: Vec<u8>,
+            ) -> std::result::Result<Vec<u8>, E> {
+                Ok(v)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Vec<u8>, E> {
+                Ok(v.as_bytes().to_vec())
+            }
+
+            // Human-readable formats render bytes as a sequence of numbers.
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Vec<u8>, A::Error> {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    out.push(byte);
+                }
+                Ok(out)
+            }
+        }
+
+        let bytes = deserializer.deserialize_byte_buf(BytesVisitor)?;
+        Schema::from_bytes(&bytes).map_err(serde::de::Error::custom)
+    }
+}
+
+impl<T: ?Sized> fmt::Display for Schema<T> {
+    /// A short description of the schema's shape, e.g. ``struct `Star` ``.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.root.describe())
     }
 }
 
@@ -644,7 +768,7 @@ mod tests {
     #[test]
     fn rejects_unknown_tags() {
         assert!(matches!(
-            SchemaNode::from_bytes(&[0xfe]),
+            SchemaNode::from_bytes(&[SCHEMA_VERSION as u8, 0xfe]),
             Err(Error::Malformed(_))
         ));
     }
@@ -652,10 +776,54 @@ mod tests {
     #[test]
     fn rejects_deep_nesting() {
         // A long chain of Option tags with no terminal leaf.
-        let bytes = vec![17u8; MAX_DEPTH + 1];
+        let mut bytes = vec![SCHEMA_VERSION as u8];
+        bytes.extend(std::iter::repeat_n(17u8, MAX_DEPTH + 1));
         assert!(matches!(
             SchemaNode::from_bytes(&bytes),
             Err(Error::DepthLimitExceeded)
         ));
+    }
+
+    #[test]
+    fn encoding_starts_with_the_schema_version() {
+        let bytes = sample().to_bytes();
+        assert_eq!(varint::read(&bytes).unwrap(), (SCHEMA_VERSION, 1));
+    }
+
+    #[test]
+    fn rejects_a_newer_schema_version() {
+        let mut bytes = Vec::new();
+        varint::write(&mut bytes, SCHEMA_VERSION + 1);
+        sample().encode_into(&mut bytes);
+        assert!(matches!(
+            SchemaNode::from_bytes(&bytes),
+            Err(Error::UnsupportedVersion {
+                what: "schema",
+                found,
+                supported: SCHEMA_VERSION,
+            }) if found == SCHEMA_VERSION + 1
+        ));
+    }
+
+    #[test]
+    fn schema_serde_round_trips_through_a_text_format() {
+        let schema = Schema::<()>::from_node(sample());
+        let json = serde_json::to_string(&schema).unwrap();
+        let back: Schema<()> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, schema);
+    }
+
+    #[test]
+    fn schema_serde_rejects_a_newer_version() {
+        let mut bytes = Vec::new();
+        varint::write(&mut bytes, SCHEMA_VERSION + 1);
+        sample().encode_into(&mut bytes);
+        let json = serde_json::to_string(&bytes).unwrap();
+        assert!(serde_json::from_str::<Schema<()>>(&json).is_err());
+    }
+
+    #[test]
+    fn display_describes_the_shape() {
+        assert_eq!(Schema::<()>::from_node(sample()).to_string(), "struct `Save`");
     }
 }

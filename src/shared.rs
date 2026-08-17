@@ -156,6 +156,7 @@ macro_rules! shared_wrapper {
             fn schema_node() -> SchemaNode {
                 SchemaNode::Shared(Box::new(T::schema_node()))
             }
+            const COLUMNS: usize = 1 + T::COLUMNS;
         }
     };
 }
@@ -166,7 +167,7 @@ shared_wrapper! {
     /// Serializes each unique object once per row; deserialization
     /// reconstructs the sharing ([`Shared::ptr_eq`] holds after a round
     /// trip). In non-carbonite serde formats the wrapper is invisible and
-    /// duplicates inline. See the [module docs](self).
+    /// duplicates inline. See the [crate-level notes](crate#shared-values).
     Shared, Rc, std::rc::Rc
 }
 
@@ -255,8 +256,6 @@ fn require_active() -> Result<()> {
 }
 
 impl<T: SerializeColumns> SerializeColumns for Shared<T> {
-    const COLUMNS: usize = 1 + T::COLUMNS;
-
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         require_active()?;
         // The key column's Vec address identifies this schema position for
@@ -277,8 +276,6 @@ impl<T: SerializeColumns> SerializeColumns for Shared<T> {
 }
 
 impl<'de, T: DeserializeColumns<'de> + 'static> DeserializeColumns<'de> for Shared<T> {
-    const COLUMNS: usize = 1 + T::COLUMNS;
-
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         require_active()?;
         let position = cursors.as_ptr() as usize;
@@ -298,8 +295,6 @@ impl<'de, T: DeserializeColumns<'de> + 'static> DeserializeColumns<'de> for Shar
 }
 
 impl<T: SerializeColumns> SerializeColumns for SharedArc<T> {
-    const COLUMNS: usize = 1 + T::COLUMNS;
-
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         require_active()?;
         let position = columns.as_ptr() as usize;
@@ -320,8 +315,6 @@ impl<T: SerializeColumns> SerializeColumns for SharedArc<T> {
 impl<'de, T: DeserializeColumns<'de> + Send + Sync + 'static> DeserializeColumns<'de>
     for SharedArc<T>
 {
-    const COLUMNS: usize = 1 + T::COLUMNS;
-
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         require_active()?;
         let position = cursors.as_ptr() as usize;

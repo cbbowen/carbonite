@@ -188,7 +188,7 @@ fn self_describing_wrappers_round_trip() {
     let bytes = carbonite::SelfDescribingSerializer::new(&schema)
         .to_vec(&value)
         .unwrap();
-    let back: Kitchen = SelfDescribingDeserializer::from_slice(&bytes).unwrap();
+    let back: Kitchen = SelfDescribingDeserializer::new().from_slice(&bytes).unwrap();
     assert_eq!(back, value);
 }
 

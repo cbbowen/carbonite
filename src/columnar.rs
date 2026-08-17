@@ -10,6 +10,10 @@
 //! [`StaticSchema`]; for any other schema (older files, foreign writers),
 //! use the serde path, which handles evolution.
 //!
+//! Both traits take their column count from
+//! [`StaticSchema::COLUMNS`](StaticSchema#associatedconstant.COLUMNS), so the
+//! read and write directions cannot disagree about a type's layout.
+//!
 //! # Contract for manual implementations
 //!
 //! Prefer the derive. A manual implementation must reproduce, byte for byte,
@@ -18,9 +22,15 @@
 //! [`StaticSchema::schema_node`]: columns are assigned depth-first, a node's
 //! own columns (lengths, presence bytes, tags) before its children's. The
 //! column slice passed to each call is exactly `Self::COLUMNS` long.
+//!
+//! Any length or count read from the input must be passed through
+//! [`checked_count`] before it is used to size an allocation or drive a loop.
+//! [`ColumnCursor::new`] builds a cursor over a byte slice so an
+//! implementation can be tested directly.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, LinkedList, VecDeque};
+use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 
@@ -34,7 +44,23 @@ pub struct ColumnCursor<'de> {
     pub(crate) pos: usize,
 }
 
+impl fmt::Debug for ColumnCursor<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ColumnCursor")
+            .field("read", &self.pos)
+            .field("remaining", &self.remaining())
+            .finish()
+    }
+}
+
 impl<'de> ColumnCursor<'de> {
+    /// Builds a cursor over one column's bytes, positioned at the start.
+    #[must_use]
+    #[inline]
+    pub fn new(buf: &'de [u8]) -> Self {
+        ColumnCursor { buf, pos: 0 }
+    }
+
     /// Takes the next `n` bytes.
     ///
     /// # Errors
@@ -55,8 +81,7 @@ impl<'de> ColumnCursor<'de> {
     /// [`Error::UnexpectedEof`] if the column is exhausted.
     #[inline]
     pub fn fixed<const N: usize>(&mut self) -> Result<[u8; N]> {
-        let slice = self.take(N)?;
-        Ok(<[u8; N]>::try_from(slice).expect("take returned exactly N bytes"))
+        <[u8; N]>::try_from(self.take(N)?).map_err(|_| Error::UnexpectedEof)
     }
 
     /// Takes the next byte.
@@ -73,8 +98,8 @@ impl<'de> ColumnCursor<'de> {
     ///
     /// # Errors
     ///
-    /// [`Error::UnexpectedEof`] / [`Error::InvalidVarint`] on truncated or
-    /// malformed input.
+    /// [`Error::UnexpectedEof`] / [`Error::InvalidVarint`] on truncated,
+    /// overlong, or non-canonical input.
     #[inline]
     pub fn varint(&mut self) -> Result<u64> {
         let (value, used) = varint::read(&self.buf[self.pos..])?;
@@ -83,6 +108,9 @@ impl<'de> ColumnCursor<'de> {
     }
 
     /// Reads a varint and converts it to a length.
+    ///
+    /// This does **not** check the length against the data available; use
+    /// [`checked_count`] for anything that sizes an allocation or a loop.
     ///
     /// # Errors
     ///
@@ -101,8 +129,9 @@ impl<'de> ColumnCursor<'de> {
     }
 
     /// Bytes not yet consumed.
+    #[must_use]
     #[inline]
-    fn remaining(&self) -> usize {
+    pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
 }
@@ -138,21 +167,71 @@ pub fn __skipped_variant(name: &'static str) -> Error {
     ))
 }
 
-/// Cap for length-hint preallocation, so malformed input can't trigger a
-/// huge allocation before the data proves itself.
+/// Cap for length-hint preallocation, so a valid but large count can't
+/// trigger one enormous reservation up front.
 const CAUTIOUS_CAPACITY: usize = 4096;
 
-/// Preallocation bound for `len` claimed elements. A value occupying at
-/// least one column always consumes at least one byte, so the remaining
-/// input bytes bound the element count; zero-column element types fall back
-/// to a fixed cap (zero-column non-ZSTs exist via `serde(skip)`).
+/// Largest repetition count accepted for a value that occupies no columns.
+///
+/// Such a value consumes no bytes, so the input carries nothing to validate
+/// its count against and a handful of header bytes could otherwise ask for an
+/// unbounded number of copies. Types like `Vec<()>` are the only ones
+/// affected, and only past a million elements.
+pub const MAX_ZERO_COLUMN_REPEAT: u64 = 1 << 20;
+
+/// Validates a repetition count read from the input against the bytes that
+/// remain to satisfy it.
+///
+/// A value occupying at least one column always writes at least one byte, so
+/// the unread bytes across `cursors` bound how many more can follow. When the
+/// repeated value occupies no columns at all, the count is instead capped at
+/// [`MAX_ZERO_COLUMN_REPEAT`].
+///
+/// # Errors
+///
+/// [`Error::LimitExceeded`] if `claimed` is larger than the input could
+/// justify, or [`Error::Malformed`] if it overflows `usize`.
 #[inline]
-fn cautious_capacity(element_columns: usize, len: usize, cursors: &[ColumnCursor<'_>]) -> usize {
+pub fn checked_count(
+    what: &'static str,
+    element_columns: usize,
+    claimed: u64,
+    cursors: &[ColumnCursor<'_>],
+) -> Result<usize> {
+    let limit = if element_columns == 0 {
+        MAX_ZERO_COLUMN_REPEAT
+    } else {
+        cursors.iter().map(|c| c.remaining() as u64).sum()
+    };
+    if claimed > limit {
+        return Err(Error::LimitExceeded {
+            what,
+            claimed,
+            limit,
+        });
+    }
+    usize::try_from(claimed).map_err(|_| Error::Malformed("length overflows usize"))
+}
+
+/// Preallocation bound for a count already validated by [`checked_count`].
+#[inline]
+fn cautious_capacity(element_columns: usize, len: usize) -> usize {
     if element_columns == 0 {
         len.min(CAUTIOUS_CAPACITY)
     } else {
-        len.min(cursors.iter().map(ColumnCursor::remaining).sum())
+        len
     }
+}
+
+/// Reads a validated element count from a length column.
+#[inline]
+fn read_count<T: ?Sized + StaticSchema>(
+    what: &'static str,
+    len_column: &mut ColumnCursor<'_>,
+    elements: &[ColumnCursor<'_>],
+) -> Result<usize> {
+    let claimed = len_column.varint()?;
+    checked_count(what, T::COLUMNS, claimed, elements)
 }
 
 /// Writes `self`'s leaves directly into column buffers.
@@ -160,13 +239,8 @@ fn cautious_capacity(element_columns: usize, len: usize, cursors: &[ColumnCursor
 /// See the [module docs](self) for the layout contract. Implement via
 /// `#[derive(Schema)]`.
 pub trait SerializeColumns: StaticSchema {
-    /// Number of columns this type's schema occupies.
-    const COLUMNS: usize;
-    /// `Some(width)` iff this type is a single fixed-width column; lets
-    /// sequences bulk-reserve.
-    const FIXED_WIDTH: Option<usize> = None;
-
-    /// Appends one value to `columns`, which is exactly `Self::COLUMNS` long.
+    /// Appends one value to `columns`, which is exactly
+    /// [`Self::COLUMNS`](StaticSchema#associatedconstant.COLUMNS) long.
     ///
     /// # Errors
     ///
@@ -180,16 +254,14 @@ pub trait SerializeColumns: StaticSchema {
 /// See the [module docs](self) for the layout contract. Implement via
 /// `#[derive(Schema)]`.
 pub trait DeserializeColumns<'de>: StaticSchema + Sized {
-    /// Number of columns this type's schema occupies.
-    const COLUMNS: usize;
-
-    /// Reads one value from `cursors`, which is exactly `Self::COLUMNS` long.
+    /// Reads one value from `cursors`, which is exactly
+    /// [`Self::COLUMNS`](StaticSchema#associatedconstant.COLUMNS) long.
     ///
     /// # Errors
     ///
     /// Any decoding failure: truncated columns, invalid tags or presence
-    /// bytes, invalid UTF-8, or domain errors (`NonZero*` zero, invalid
-    /// `char`).
+    /// bytes, invalid UTF-8, counts larger than the input can justify, or
+    /// domain errors (`NonZero*` zero, invalid `char`).
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self>;
 }
 
@@ -198,11 +270,8 @@ pub trait DeserializeColumns<'de>: StaticSchema + Sized {
 // ---------------------------------------------------------------------------
 
 macro_rules! primitive_columns {
-    ($($ty:ty => $width:expr,)*) => {$(
+    ($($ty:ty,)*) => {$(
         impl SerializeColumns for $ty {
-            const COLUMNS: usize = 1;
-            const FIXED_WIDTH: Option<usize> = Some($width);
-
             #[inline]
             fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
                 columns[0].extend_from_slice(&self.to_le_bytes());
@@ -211,8 +280,6 @@ macro_rules! primitive_columns {
         }
 
         impl<'de> DeserializeColumns<'de> for $ty {
-            const COLUMNS: usize = 1;
-
             #[inline]
             fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
                 Ok(<$ty>::from_le_bytes(cursors[0].fixed()?))
@@ -222,15 +289,12 @@ macro_rules! primitive_columns {
 }
 
 primitive_columns! {
-    i8 => 1, i16 => 2, i32 => 4, i64 => 8, i128 => 16,
-    u8 => 1, u16 => 2, u32 => 4, u64 => 8, u128 => 16,
-    f32 => 4, f64 => 8,
+    i8, i16, i32, i64, i128,
+    u8, u16, u32, u64, u128,
+    f32, f64,
 }
 
 impl SerializeColumns for bool {
-    const COLUMNS: usize = 1;
-    const FIXED_WIDTH: Option<usize> = Some(1);
-
     #[inline]
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         columns[0].push(u8::from(*self));
@@ -239,8 +303,6 @@ impl SerializeColumns for bool {
 }
 
 impl<'de> DeserializeColumns<'de> for bool {
-    const COLUMNS: usize = 1;
-
     #[inline]
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         match cursors[0].byte()? {
@@ -255,9 +317,6 @@ impl<'de> DeserializeColumns<'de> for bool {
 }
 
 impl SerializeColumns for char {
-    const COLUMNS: usize = 1;
-    const FIXED_WIDTH: Option<usize> = Some(4);
-
     #[inline]
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         columns[0].extend_from_slice(&(*self as u32).to_le_bytes());
@@ -266,8 +325,6 @@ impl SerializeColumns for char {
 }
 
 impl<'de> DeserializeColumns<'de> for char {
-    const COLUMNS: usize = 1;
-
     #[inline]
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         let scalar = u32::from_le_bytes(cursors[0].fixed()?);
@@ -280,9 +337,6 @@ impl<'de> DeserializeColumns<'de> for char {
 
 // serde puts usize/isize on the wire as u64/i64.
 impl SerializeColumns for usize {
-    const COLUMNS: usize = 1;
-    const FIXED_WIDTH: Option<usize> = Some(8);
-
     #[inline]
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         columns[0].extend_from_slice(&(*self as u64).to_le_bytes());
@@ -291,8 +345,6 @@ impl SerializeColumns for usize {
 }
 
 impl<'de> DeserializeColumns<'de> for usize {
-    const COLUMNS: usize = 1;
-
     #[inline]
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         usize::try_from(u64::from_le_bytes(cursors[0].fixed()?))
@@ -301,9 +353,6 @@ impl<'de> DeserializeColumns<'de> for usize {
 }
 
 impl SerializeColumns for isize {
-    const COLUMNS: usize = 1;
-    const FIXED_WIDTH: Option<usize> = Some(8);
-
     #[inline]
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         columns[0].extend_from_slice(&(*self as i64).to_le_bytes());
@@ -312,8 +361,6 @@ impl SerializeColumns for isize {
 }
 
 impl<'de> DeserializeColumns<'de> for isize {
-    const COLUMNS: usize = 1;
-
     #[inline]
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         isize::try_from(i64::from_le_bytes(cursors[0].fixed()?))
@@ -324,9 +371,6 @@ impl<'de> DeserializeColumns<'de> for isize {
 macro_rules! nonzero_columns {
     ($($ty:ty => $prim:ty,)*) => {$(
         impl SerializeColumns for $ty {
-            const COLUMNS: usize = 1;
-            const FIXED_WIDTH: Option<usize> = <$prim as SerializeColumns>::FIXED_WIDTH;
-
             #[inline]
             fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
                 self.get().serialize_columns(columns)
@@ -334,8 +378,6 @@ macro_rules! nonzero_columns {
         }
 
         impl<'de> DeserializeColumns<'de> for $ty {
-            const COLUMNS: usize = 1;
-
             #[inline]
             fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
                 let value = <$prim as DeserializeColumns>::deserialize_columns(cursors)?;
@@ -366,8 +408,6 @@ nonzero_columns! {
 // ---------------------------------------------------------------------------
 
 impl SerializeColumns for () {
-    const COLUMNS: usize = 0;
-
     #[inline]
     fn serialize_columns(&self, _columns: &mut [Vec<u8>]) -> Result<()> {
         Ok(())
@@ -375,8 +415,6 @@ impl SerializeColumns for () {
 }
 
 impl<'de> DeserializeColumns<'de> for () {
-    const COLUMNS: usize = 0;
-
     #[inline]
     fn deserialize_columns(_cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         Ok(())
@@ -384,8 +422,6 @@ impl<'de> DeserializeColumns<'de> for () {
 }
 
 impl SerializeColumns for str {
-    const COLUMNS: usize = 2;
-
     #[inline]
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         write_varint(&mut columns[0], self.len() as u64);
@@ -395,8 +431,6 @@ impl SerializeColumns for str {
 }
 
 impl SerializeColumns for String {
-    const COLUMNS: usize = 2;
-
     #[inline]
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         self.as_str().serialize_columns(columns)
@@ -404,19 +438,13 @@ impl SerializeColumns for String {
 }
 
 impl<'de> DeserializeColumns<'de> for String {
-    const COLUMNS: usize = 2;
-
     #[inline]
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
-        let len = cursors[0].varint_len()?;
-        let bytes = cursors[1].take(len)?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidUtf8)
+        Ok(<&str>::deserialize_columns(cursors)?.to_owned())
     }
 }
 
 impl<'de: 'a, 'a> DeserializeColumns<'de> for &'a str {
-    const COLUMNS: usize = 2;
-
     #[inline]
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         let len = cursors[0].varint_len()?;
@@ -426,8 +454,6 @@ impl<'de: 'a, 'a> DeserializeColumns<'de> for &'a str {
 }
 
 impl<'de: 'a, 'a> DeserializeColumns<'de> for Cow<'a, str> {
-    const COLUMNS: usize = 2;
-
     #[inline]
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         Ok(Cow::Borrowed(<&str>::deserialize_columns(cursors)?))
@@ -439,8 +465,6 @@ impl<'de: 'a, 'a> DeserializeColumns<'de> for Cow<'a, str> {
 // ---------------------------------------------------------------------------
 
 impl<T: SerializeColumns> SerializeColumns for Option<T> {
-    const COLUMNS: usize = 1 + T::COLUMNS;
-
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         match self {
             None => {
@@ -456,8 +480,6 @@ impl<T: SerializeColumns> SerializeColumns for Option<T> {
 }
 
 impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for Option<T> {
-    const COLUMNS: usize = 1 + T::COLUMNS;
-
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         match cursors[0].byte()? {
             0 => Ok(None),
@@ -471,8 +493,6 @@ impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for Option<T> {
 }
 
 impl<T: SerializeColumns> SerializeColumns for Vec<T> {
-    const COLUMNS: usize = 1 + T::COLUMNS;
-
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         write_varint(&mut columns[0], self.len() as u64);
         let elems = &mut columns[1..];
@@ -488,12 +508,10 @@ impl<T: SerializeColumns> SerializeColumns for Vec<T> {
 }
 
 impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for Vec<T> {
-    const COLUMNS: usize = 1 + T::COLUMNS;
-
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
-        let len = cursors[0].varint_len()?;
-        let elems = &mut cursors[1..];
-        let mut out = Vec::with_capacity(cautious_capacity(T::COLUMNS, len, elems));
+        let (len_column, elems) = cursors.split_at_mut(1);
+        let len = read_count::<T>("sequence length", &mut len_column[0], elems)?;
+        let mut out = Vec::with_capacity(cautious_capacity(T::COLUMNS, len));
         for _ in 0..len {
             out.push(T::deserialize_columns(&mut *elems)?);
         }
@@ -504,8 +522,6 @@ impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for Vec<T> {
 macro_rules! seq_columns {
     ($($ty:ident => [$($bound:path),*],)*) => {$(
         impl<T: SerializeColumns $(+ $bound)*> SerializeColumns for $ty<T> {
-            const COLUMNS: usize = 1 + T::COLUMNS;
-
             fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
                 write_varint(&mut columns[0], self.len() as u64);
                 let elems = &mut columns[1..];
@@ -517,11 +533,9 @@ macro_rules! seq_columns {
         }
 
         impl<'de, T: DeserializeColumns<'de> $(+ $bound)*> DeserializeColumns<'de> for $ty<T> {
-            const COLUMNS: usize = 1 + T::COLUMNS;
-
             fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
-                let len = cursors[0].varint_len()?;
-                let elems = &mut cursors[1..];
+                let (len_column, elems) = cursors.split_at_mut(1);
+                let len = read_count::<T>("sequence length", &mut len_column[0], elems)?;
                 (0..len).map(|_| T::deserialize_columns(&mut *elems)).collect()
             }
         }
@@ -536,8 +550,6 @@ seq_columns! {
 }
 
 impl<T: SerializeColumns, S> SerializeColumns for HashSet<T, S> {
-    const COLUMNS: usize = 1 + T::COLUMNS;
-
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         write_varint(&mut columns[0], self.len() as u64);
         let elems = &mut columns[1..];
@@ -553,11 +565,9 @@ where
     T: DeserializeColumns<'de> + Hash + Eq,
     S: BuildHasher + Default,
 {
-    const COLUMNS: usize = 1 + T::COLUMNS;
-
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
-        let len = cursors[0].varint_len()?;
-        let elems = &mut cursors[1..];
+        let (len_column, elems) = cursors.split_at_mut(1);
+        let len = read_count::<T>("sequence length", &mut len_column[0], elems)?;
         (0..len)
             .map(|_| T::deserialize_columns(&mut *elems))
             .collect()
@@ -565,8 +575,6 @@ where
 }
 
 impl<T: SerializeColumns, const N: usize> SerializeColumns for [T; N] {
-    const COLUMNS: usize = N * T::COLUMNS;
-
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         let mut rest = columns;
         for item in self {
@@ -577,8 +585,6 @@ impl<T: SerializeColumns, const N: usize> SerializeColumns for [T; N] {
 }
 
 impl<'de, T: DeserializeColumns<'de>, const N: usize> DeserializeColumns<'de> for [T; N] {
-    const COLUMNS: usize = N * T::COLUMNS;
-
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         // Build in place via `array::from_fn` — no heap allocation. The first
         // error short-circuits the remaining reads and is returned after.
@@ -606,8 +612,6 @@ impl<'de, T: DeserializeColumns<'de>, const N: usize> DeserializeColumns<'de> fo
 macro_rules! tuple_columns {
     ($(($($idx:tt $name:ident)+),)*) => {$(
         impl<$($name: SerializeColumns),+> SerializeColumns for ($($name,)+) {
-            const COLUMNS: usize = 0 $(+ $name::COLUMNS)+;
-
             fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
                 let mut rest = columns;
                 $(
@@ -618,8 +622,6 @@ macro_rules! tuple_columns {
         }
 
         impl<'de, $($name: DeserializeColumns<'de>),+> DeserializeColumns<'de> for ($($name,)+) {
-            const COLUMNS: usize = 0 $(+ $name::COLUMNS)+;
-
             fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
                 let mut rest = cursors;
                 Ok(($(
@@ -649,31 +651,7 @@ tuple_columns! {
     (0 T0 1 T1 2 T2 3 T3 4 T4 5 T5 6 T6 7 T7 8 T8 9 T9 10 T10 11 T11 12 T12 13 T13 14 T14 15 T15),
 }
 
-macro_rules! map_columns {
-    ($ty:ident, $($de_key_bound:path),+) => {
-        impl<'de, K, V> DeserializeColumns<'de> for $ty<K, V>
-        where
-            K: DeserializeColumns<'de> $(+ $de_key_bound)+,
-            V: DeserializeColumns<'de>,
-        {
-            const COLUMNS: usize = 1 + K::COLUMNS + V::COLUMNS;
-
-            fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
-                let len = cursors[0].varint_len()?;
-                let (keys, values) = cursors[1..].split_at_mut(K::COLUMNS);
-                (0..len)
-                    .map(|_| {
-                        Ok((K::deserialize_columns(&mut *keys)?, V::deserialize_columns(&mut *values)?))
-                    })
-                    .collect()
-            }
-        }
-    };
-}
-
 impl<K: SerializeColumns, V: SerializeColumns, S> SerializeColumns for HashMap<K, V, S> {
-    const COLUMNS: usize = 1 + K::COLUMNS + V::COLUMNS;
-
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         write_varint(&mut columns[0], self.len() as u64);
         let (keys, values) = columns[1..].split_at_mut(K::COLUMNS);
@@ -686,8 +664,6 @@ impl<K: SerializeColumns, V: SerializeColumns, S> SerializeColumns for HashMap<K
 }
 
 impl<K: SerializeColumns, V: SerializeColumns> SerializeColumns for BTreeMap<K, V> {
-    const COLUMNS: usize = 1 + K::COLUMNS + V::COLUMNS;
-
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         write_varint(&mut columns[0], self.len() as u64);
         let (keys, values) = columns[1..].split_at_mut(K::COLUMNS);
@@ -699,7 +675,26 @@ impl<K: SerializeColumns, V: SerializeColumns> SerializeColumns for BTreeMap<K, 
     }
 }
 
-map_columns!(BTreeMap, Ord);
+impl<'de, K, V> DeserializeColumns<'de> for BTreeMap<K, V>
+where
+    K: DeserializeColumns<'de> + Ord,
+    V: DeserializeColumns<'de>,
+{
+    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+        let (len_column, entries) = cursors.split_at_mut(1);
+        let claimed = len_column[0].varint()?;
+        let len = checked_count("map length", K::COLUMNS + V::COLUMNS, claimed, entries)?;
+        let (keys, values) = entries.split_at_mut(K::COLUMNS);
+        (0..len)
+            .map(|_| {
+                Ok((
+                    K::deserialize_columns(&mut *keys)?,
+                    V::deserialize_columns(&mut *values)?,
+                ))
+            })
+            .collect()
+    }
+}
 
 impl<'de, K, V, S> DeserializeColumns<'de> for HashMap<K, V, S>
 where
@@ -707,11 +702,11 @@ where
     V: DeserializeColumns<'de>,
     S: BuildHasher + Default,
 {
-    const COLUMNS: usize = 1 + K::COLUMNS + V::COLUMNS;
-
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
-        let len = cursors[0].varint_len()?;
-        let (keys, values) = cursors[1..].split_at_mut(K::COLUMNS);
+        let (len_column, entries) = cursors.split_at_mut(1);
+        let claimed = len_column[0].varint()?;
+        let len = checked_count("map length", K::COLUMNS + V::COLUMNS, claimed, entries)?;
+        let (keys, values) = entries.split_at_mut(K::COLUMNS);
         (0..len)
             .map(|_| {
                 Ok((
@@ -727,87 +722,37 @@ where
 // Pointers and wrappers.
 // ---------------------------------------------------------------------------
 
-impl<T: SerializeColumns + ?Sized> SerializeColumns for &T {
-    const COLUMNS: usize = T::COLUMNS;
-    const FIXED_WIDTH: Option<usize> = T::FIXED_WIDTH;
-
-    #[inline]
-    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
-        (**self).serialize_columns(columns)
-    }
+macro_rules! deref_ser_columns {
+    ($($ty:ty),* $(,)?) => {$(
+        impl<T: SerializeColumns + ?Sized> SerializeColumns for $ty {
+            #[inline]
+            fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
+                (**self).serialize_columns(columns)
+            }
+        }
+    )*};
 }
 
-impl<T: SerializeColumns + ?Sized> SerializeColumns for &mut T {
-    const COLUMNS: usize = T::COLUMNS;
-    const FIXED_WIDTH: Option<usize> = T::FIXED_WIDTH;
+deref_ser_columns!(&T, &mut T, Box<T>, std::rc::Rc<T>, std::sync::Arc<T>);
 
-    #[inline]
-    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
-        (**self).serialize_columns(columns)
-    }
+macro_rules! wrap_de_columns {
+    ($($ty:ty => $ctor:path),* $(,)?) => {$(
+        impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for $ty {
+            #[inline]
+            fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
+                Ok($ctor(T::deserialize_columns(cursors)?))
+            }
+        }
+    )*};
 }
 
-impl<T: SerializeColumns + ?Sized> SerializeColumns for Box<T> {
-    const COLUMNS: usize = T::COLUMNS;
-    const FIXED_WIDTH: Option<usize> = T::FIXED_WIDTH;
-
-    #[inline]
-    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
-        (**self).serialize_columns(columns)
-    }
-}
-
-impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for Box<T> {
-    const COLUMNS: usize = T::COLUMNS;
-
-    #[inline]
-    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
-        Ok(Box::new(T::deserialize_columns(cursors)?))
-    }
-}
-
-impl<T: SerializeColumns + ?Sized> SerializeColumns for std::rc::Rc<T> {
-    const COLUMNS: usize = T::COLUMNS;
-    const FIXED_WIDTH: Option<usize> = T::FIXED_WIDTH;
-
-    #[inline]
-    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
-        (**self).serialize_columns(columns)
-    }
-}
-
-impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for std::rc::Rc<T> {
-    const COLUMNS: usize = T::COLUMNS;
-
-    #[inline]
-    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
-        Ok(std::rc::Rc::new(T::deserialize_columns(cursors)?))
-    }
-}
-
-impl<T: SerializeColumns + ?Sized> SerializeColumns for std::sync::Arc<T> {
-    const COLUMNS: usize = T::COLUMNS;
-    const FIXED_WIDTH: Option<usize> = T::FIXED_WIDTH;
-
-    #[inline]
-    fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
-        (**self).serialize_columns(columns)
-    }
-}
-
-impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for std::sync::Arc<T> {
-    const COLUMNS: usize = T::COLUMNS;
-
-    #[inline]
-    fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
-        Ok(std::sync::Arc::new(T::deserialize_columns(cursors)?))
-    }
+wrap_de_columns! {
+    Box<T> => Box::new,
+    std::rc::Rc<T> => std::rc::Rc::new,
+    std::sync::Arc<T> => std::sync::Arc::new,
 }
 
 impl<T: SerializeColumns + ToOwned + ?Sized> SerializeColumns for Cow<'_, T> {
-    const COLUMNS: usize = T::COLUMNS;
-    const FIXED_WIDTH: Option<usize> = T::FIXED_WIDTH;
-
     #[inline]
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         self.as_ref().serialize_columns(columns)
@@ -819,8 +764,6 @@ impl<T: SerializeColumns + ToOwned + ?Sized> SerializeColumns for Cow<'_, T> {
 // ---------------------------------------------------------------------------
 
 impl<T: SerializeColumns, E: SerializeColumns> SerializeColumns for Result<T, E> {
-    const COLUMNS: usize = 1 + T::COLUMNS + E::COLUMNS;
-
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         match self {
             Ok(value) => {
@@ -838,8 +781,6 @@ impl<T: SerializeColumns, E: SerializeColumns> SerializeColumns for Result<T, E>
 impl<'de, T: DeserializeColumns<'de>, E: DeserializeColumns<'de>> DeserializeColumns<'de>
     for Result<T, E>
 {
-    const COLUMNS: usize = 1 + T::COLUMNS + E::COLUMNS;
-
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         match cursors[0].varint()? {
             0 => Ok(Ok(T::deserialize_columns(&mut cursors[1..1 + T::COLUMNS])?)),
@@ -850,8 +791,6 @@ impl<'de, T: DeserializeColumns<'de>, E: DeserializeColumns<'de>> DeserializeCol
 }
 
 impl<T: ?Sized> SerializeColumns for PhantomData<T> {
-    const COLUMNS: usize = 0;
-
     #[inline]
     fn serialize_columns(&self, _columns: &mut [Vec<u8>]) -> Result<()> {
         Ok(())
@@ -859,8 +798,6 @@ impl<T: ?Sized> SerializeColumns for PhantomData<T> {
 }
 
 impl<'de, T: ?Sized> DeserializeColumns<'de> for PhantomData<T> {
-    const COLUMNS: usize = 0;
-
     #[inline]
     fn deserialize_columns(_cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         Ok(PhantomData)
@@ -868,8 +805,6 @@ impl<'de, T: ?Sized> DeserializeColumns<'de> for PhantomData<T> {
 }
 
 impl SerializeColumns for std::time::Duration {
-    const COLUMNS: usize = 2;
-
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         columns[0].extend_from_slice(&self.as_secs().to_le_bytes());
         columns[1].extend_from_slice(&self.subsec_nanos().to_le_bytes());
@@ -878,8 +813,6 @@ impl SerializeColumns for std::time::Duration {
 }
 
 impl<'de> DeserializeColumns<'de> for std::time::Duration {
-    const COLUMNS: usize = 2;
-
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         let secs = u64::from_le_bytes(cursors[0].fixed()?);
         let nanos = u32::from_le_bytes(cursors[1].fixed()?);
@@ -891,8 +824,6 @@ impl<'de> DeserializeColumns<'de> for std::time::Duration {
 }
 
 impl SerializeColumns for std::time::SystemTime {
-    const COLUMNS: usize = 2;
-
     fn serialize_columns(&self, columns: &mut [Vec<u8>]) -> Result<()> {
         let since_epoch = self
             .duration_since(std::time::UNIX_EPOCH)
@@ -902,8 +833,6 @@ impl SerializeColumns for std::time::SystemTime {
 }
 
 impl<'de> DeserializeColumns<'de> for std::time::SystemTime {
-    const COLUMNS: usize = 2;
-
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         let since_epoch = std::time::Duration::deserialize_columns(cursors)?;
         std::time::UNIX_EPOCH
@@ -911,5 +840,46 @@ impl<'de> DeserializeColumns<'de> for std::time::SystemTime {
             .ok_or_else(|| {
                 Error::Message("SystemTime overflows the representable range".to_owned())
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_can_be_built_and_read_directly() {
+        let mut cursor = ColumnCursor::new(&[0x2a, 0x00, 0x00, 0x00]);
+        assert_eq!(cursor.remaining(), 4);
+        assert_eq!(u32::from_le_bytes(cursor.fixed().unwrap()), 42);
+        assert!(cursor.at_end());
+        assert!(matches!(cursor.byte(), Err(Error::UnexpectedEof)));
+    }
+
+    #[test]
+    fn checked_count_bounds_by_remaining_bytes() {
+        let cursors = [ColumnCursor::new(&[0; 10])];
+        assert_eq!(checked_count("test", 1, 10, &cursors).unwrap(), 10);
+        assert!(matches!(
+            checked_count("test", 1, 11, &cursors),
+            Err(Error::LimitExceeded {
+                claimed: 11,
+                limit: 10,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn checked_count_caps_zero_column_elements() {
+        let cursors: [ColumnCursor<'_>; 0] = [];
+        assert_eq!(
+            checked_count("test", 0, MAX_ZERO_COLUMN_REPEAT, &cursors).unwrap(),
+            MAX_ZERO_COLUMN_REPEAT as usize
+        );
+        assert!(matches!(
+            checked_count("test", 0, MAX_ZERO_COLUMN_REPEAT + 1, &cursors),
+            Err(Error::LimitExceeded { .. })
+        ));
     }
 }

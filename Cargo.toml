@@ -1,12 +1,26 @@
 [workspace]
 members = ["carbonite-derive"]
 
-[package]
-name = "carbonite"
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "Schema-separated columnar serialization built on serde"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/cbbowen/carbonite"
+authors = ["Chris Bowen"]
+
+[package]
+name = "carbonite"
+description = "Schema-separated columnar serialization built on serde"
+readme = "README.md"
+keywords = ["serde", "serialization", "columnar", "schema", "binary"]
+categories = ["encoding", "data-structures", "compression"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [features]
 default = ["derive"]
@@ -28,3 +42,7 @@ serde_json = "1"
 [[bench]]
 name = "compare"
 harness = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

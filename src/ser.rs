@@ -1,6 +1,7 @@
 //! Columnar serialization: a [`serde::Serializer`] that walks the schema in
 //! lockstep with the value and routes every leaf into its column buffer.
 
+use std::fmt;
 use std::marker::PhantomData;
 
 use serde::ser::{self, Serialize};
@@ -19,6 +20,15 @@ use crate::varint;
 pub struct Serializer<'s, T: ?Sized> {
     schema: &'s Schema<T>,
     layout: Layout,
+}
+
+impl<T: ?Sized> fmt::Debug for Serializer<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Serializer")
+            .field("schema", &format_args!("{}", self.schema))
+            .field("columns", &self.layout.columns)
+            .finish()
+    }
 }
 
 impl<'s, T: ?Sized> Serializer<'s, T> {
@@ -77,6 +87,11 @@ impl<'s, T: ?Sized> Serializer<'s, T> {
 
     /// Starts a batch: many values serialized against one schema into one
     /// blob, sharing columns.
+    ///
+    /// A `Batch` owns the column buffers, and
+    /// [`finish_into`](Batch::finish_into) hands back a blob while keeping
+    /// them for reuse — so a hot loop can allocate once rather than once per
+    /// value.
     pub fn batch(&self) -> Batch<'_, T> {
         Batch {
             root_node: self.schema.node(),
@@ -186,18 +201,80 @@ impl<T: ?Sized> Batch<'_, T> {
     /// Assembles the blob: row count, column count, column byte lengths,
     /// then the column bytes back to back.
     #[must_use]
-    pub fn finish(self) -> Vec<u8> {
+    pub fn finish(mut self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.encoded_len());
+        self.write_into(&mut out);
+        out
+    }
+
+    /// Appends the blob to `out` and clears the batch for reuse, keeping the
+    /// column buffers' capacity.
+    ///
+    /// This is the allocation-free way to write many blobs: build one
+    /// `Batch`, and alternate `push_columns` / `finish_into` without giving
+    /// the buffers back to the allocator in between.
+    ///
+    /// ```
+    /// # use serde::{Serialize, Deserialize};
+    /// # #[derive(Serialize, Deserialize, carbonite::Schema)]
+    /// # struct Reading { sensor: u16, celsius: f32 }
+    /// use carbonite::{Serializer, StaticSchema};
+    ///
+    /// let schema = Reading::schema();
+    /// let ser = Serializer::new(&schema);
+    /// let mut batch = ser.batch();
+    /// let mut blob = Vec::new();
+    ///
+    /// for sensor in 0..3 {
+    ///     blob.clear();
+    ///     batch.push_columns(&Reading { sensor, celsius: 20.0 })?;
+    ///     batch.finish_into(&mut blob);       // batch is empty again
+    ///     assert_eq!(batch.rows(), 0);
+    /// }
+    /// # Ok::<(), carbonite::Error>(())
+    /// ```
+    pub fn finish_into(&mut self, out: &mut Vec<u8>) {
+        out.reserve(self.encoded_len());
+        self.write_into(out);
+    }
+
+    /// Discards every row pushed so far, keeping the column buffers'
+    /// capacity.
+    pub fn reset(&mut self) {
+        for column in &mut self.columns {
+            column.clear();
+        }
+        self.rows = 0;
+    }
+
+    fn encoded_len(&self) -> usize {
         let data_len: usize = self.columns.iter().map(Vec::len).sum();
-        let mut out = Vec::with_capacity(data_len + 2 + 5 * self.columns.len());
-        varint::write(&mut out, self.rows);
-        varint::write(&mut out, self.columns.len() as u64);
+        data_len + 2 + 5 * self.columns.len()
+    }
+
+    fn write_into(&mut self, out: &mut Vec<u8>) {
+        varint::write(out, self.rows);
+        varint::write(out, self.columns.len() as u64);
         for column in &self.columns {
-            varint::write(&mut out, column.len() as u64);
+            varint::write(out, column.len() as u64);
         }
         for column in &self.columns {
             out.extend_from_slice(column);
         }
-        out
+        self.reset();
+    }
+}
+
+impl<T: ?Sized> fmt::Debug for Batch<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Batch")
+            .field("rows", &self.rows)
+            .field("columns", &self.columns.len())
+            .field(
+                "bytes",
+                &self.columns.iter().map(Vec::len).sum::<usize>(),
+            )
+            .finish()
     }
 }
 
@@ -479,7 +556,7 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
 
     fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq> {
         match (self.node, self.lnode) {
-            (SchemaNode::Seq(elem), LNode::Seq { len, elem: lelem }) => Ok(SeqSerializer {
+            (SchemaNode::Seq(elem), LNode::Seq { len, elem: lelem, .. }) => Ok(SeqSerializer {
                 elem,
                 lelem,
                 len_col: *len,
@@ -572,6 +649,7 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
                     len,
                     key: lkey,
                     value: lvalue,
+                    ..
                 },
             ) => Ok(MapSerializer {
                 key,
@@ -655,7 +733,7 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
 // Compound serializers.
 // ---------------------------------------------------------------------------
 
-pub struct SeqSerializer<'a, 'c> {
+pub(crate) struct SeqSerializer<'a, 'c> {
     elem: &'a SchemaNode,
     lelem: &'a LNode,
     len_col: ColId,
@@ -684,7 +762,7 @@ impl ser::SerializeSeq for SeqSerializer<'_, '_> {
 }
 
 /// Positional fields: tuples, tuple structs, and tuple variants.
-pub struct ProductSerializer<'a, 'c> {
+pub(crate) struct ProductSerializer<'a, 'c> {
     fields: &'a [SchemaNode],
     lfields: &'a [LNode],
     columns: &'c mut Vec<Vec<u8>>,
@@ -757,7 +835,7 @@ impl ser::SerializeTupleVariant for ProductSerializer<'_, '_> {
 
 /// Named fields: structs and struct variants. Field order must match the
 /// schema (serde derives always emit declaration order).
-pub struct StructSerializer<'a, 'c> {
+pub(crate) struct StructSerializer<'a, 'c> {
     fields: &'a [(String, SchemaNode)],
     lfields: &'a [LNode],
     columns: &'c mut Vec<Vec<u8>>,
@@ -846,7 +924,7 @@ impl ser::SerializeStructVariant for StructSerializer<'_, '_> {
     }
 }
 
-pub struct MapSerializer<'a, 'c> {
+pub(crate) struct MapSerializer<'a, 'c> {
     key: &'a SchemaNode,
     lkey: &'a LNode,
     value: &'a SchemaNode,

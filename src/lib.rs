@@ -84,10 +84,16 @@
 //! ([`SerializeColumns`] / [`DeserializeColumns`]): straight-line code that
 //! reads and writes the exact same bytes as the serde path, with no schema
 //! interpretation per value. Since serialization always targets the type's
-//! *current* schema, `to_vec_columns` is the preferred writer for derived
+//! *current* schema, the columnar writer is the preferred one for derived
 //! types; on the read side the columnar path applies when the blob's schema
 //! equals the type's own, and the serde path handles everything else
-//! (older files, foreign writers — anything needing evolution):
+//! (older files, foreign writers — anything needing evolution).
+//!
+//! Both directions come in single-value and batch form:
+//! [`to_vec_columns`](Serializer::to_vec_columns) /
+//! [`from_slice_columns`](Deserializer::from_slice_columns) for one value,
+//! [`push_columns`](Batch::push_columns) /
+//! [`rows_columns`](Deserializer::rows_columns) for many.
 //!
 //! ```
 //! # use serde::{Serialize, Deserialize};
@@ -101,6 +107,19 @@
 //! let blob = Serializer::new(&schema).to_vec_columns(&pixel)?;
 //! let back: Pixel = Deserializer::new_static(schema).from_slice_columns(&blob)?;
 //! assert_eq!(back, pixel);
+//! # Ok::<(), carbonite::Error>(())
+//! ```
+//!
+//! [`to_vec_static`] / [`from_slice_static`] are the self-describing
+//! one-shots that take this path, with no tracing pass:
+//!
+//! ```
+//! # use serde::{Serialize, Deserialize};
+//! # #[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug)]
+//! # struct Pixel { x: u16, y: u16, luma: f32 }
+//! let pixel = Pixel { x: 3, y: 4, luma: 0.5 };
+//! let bytes = carbonite::to_vec_static(&pixel)?;
+//! assert_eq!(carbonite::from_slice_static::<Pixel>(&bytes)?, pixel);
 //! # Ok::<(), carbonite::Error>(())
 //! ```
 //!
@@ -137,6 +156,28 @@
 //! # Ok::<(), carbonite::Error>(())
 //! ```
 //!
+//! # Untrusted input
+//!
+//! Deserialization treats every blob as hostile. The header's row count and
+//! every length inside the data are validated against the bytes actually
+//! present before they size an allocation or drive a loop, so decoding work
+//! stays proportional to the input; schemas are depth-limited; varints must
+//! be canonically encoded. Malformed input produces an [`Error`], never a
+//! panic, an abort, or an unbounded allocation.
+//!
+//! The one count the data cannot bound is a repetition of a value that
+//! occupies no columns — `Vec<()>` and friends, which encode nothing per
+//! element. Those are capped at
+//! [`MAX_ZERO_COLUMN_REPEAT`](columnar::MAX_ZERO_COLUMN_REPEAT).
+//!
+//! # Compatibility
+//!
+//! The wire format is versioned in two places: [`SCHEMA_VERSION`] leads every
+//! [`Schema::to_bytes`], and [`FORMAT_VERSION`] leads every self-describing
+//! frame. carbonite reads every version up to and including the ones it
+//! declares, and rejects newer ones with [`Error::UnsupportedVersion`] rather
+//! than misreading them. Blobs written by this release will stay readable.
+//!
 //! # Limitations
 //!
 //! The data layer is not self-describing, so serde features that require a
@@ -147,6 +188,13 @@
 //! and `#[serde(skip_serializing_if)]` are also rejected — columnar rows must
 //! be complete. Adding a field requires `#[serde(default)]` to read old data,
 //! exactly as with JSON.
+//!
+//! Blob bytes are canonical for a given value with one exception:
+//! `HashMap`/`HashSet` serialize in iteration order, which varies between
+//! runs. Use `BTreeMap`/`BTreeSet` where reproducible bytes matter.
+
+#![warn(missing_docs)]
+#![forbid(unsafe_code)]
 
 // Compile the README's examples as doctests so they can never rot.
 #[cfg(doctest)]
@@ -165,31 +213,58 @@ mod static_schema;
 mod trace;
 mod varint;
 
-pub use columnar::{DeserializeColumns, SerializeColumns};
-pub use de::{Deserializer, Rows};
+pub use columnar::{ColumnCursor, DeserializeColumns, SerializeColumns};
+pub use de::{Deserializer, Rows, RowsColumns};
 pub use error::{Error, Result};
-pub use schema::{Primitive, Schema, SchemaNode, VariantNode};
-pub use self_describing::{SelfDescribingDeserializer, SelfDescribingSerializer};
+pub use schema::{SCHEMA_VERSION, Schema};
+pub use self_describing::{
+    FORMAT_VERSION, MAGIC, SelfDescribingDeserializer, SelfDescribingSerializer,
+    is_self_describing, peek_schema,
+};
 pub use ser::{Batch, Serializer};
 pub use shared::{Shared, SharedArc};
 pub use static_schema::StaticSchema;
 
-/// Derives [`StaticSchema`]: a compile-time schema identical to what runtime
-/// tracing would discover, honoring the serde attributes that affect wire
-/// shape (`rename`, `rename_all`, `rename_all_fields`, `skip`,
-/// `transparent`). Lives in the same namespace trick serde uses: `Schema` is
-/// both this derive macro and the [`struct@Schema`] type.
+#[doc(hidden)]
+pub use schema::{Primitive, SchemaNode, VariantNode};
+
+/// Derives the compile-time schema for a type.
+///
+/// This implements three traits: [`StaticSchema`], giving a schema identical
+/// to what runtime tracing would discover, plus [`SerializeColumns`] and
+/// [`DeserializeColumns`], the monomorphized columnar fast paths over that
+/// schema.
+///
+/// It honors the serde attributes that affect wire shape (`rename`,
+/// `rename_all`, `rename_all_fields`, `skip`, `transparent`) and rejects, at
+/// compile time, the ones carbonite cannot represent. Use
+/// `#[carbonite(crate = "...")]` to point the generated code at a renamed
+/// carbonite dependency.
+///
+/// The name is the same namespace trick serde uses: `Schema` is both this
+/// derive macro and the [`struct@Schema`] type.
+///
+/// # The type's serde impls must match
+///
+/// The derived schema describes how serde's *derived* `Serialize` /
+/// `Deserialize` lay the type out. A hand-written serde impl that differs —
+/// reordered fields, a different field count, a custom representation —
+/// produces a schema that silently disagrees with the serde path. Derive
+/// `Serialize`/`Deserialize` alongside `Schema`, or use runtime tracing
+/// ([`Schema::new`]), which reads the real `Deserialize` impl.
 #[cfg(feature = "derive")]
 pub use carbonite_derive::Schema;
 
 use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde::de::{Deserialize, DeserializeOwned};
 
 /// Serializes `value` into a self-describing blob (schema included).
 ///
-/// Convenience for one-shot use; it traces the schema on every call. For
-/// repeated serialization, build a [`struct@Schema`] once and use
-/// [`SelfDescribingSerializer`] or [`Serializer`].
+/// Convenience for one-shot use; it traces the schema on every call. When `T`
+/// carries `#[derive(Schema)]`, prefer [`to_vec_static`], which skips tracing
+/// and takes the columnar fast path. For repeated serialization, build a
+/// [`struct@Schema`] once and use [`SelfDescribingSerializer`] or
+/// [`Serializer`].
 ///
 /// `T` must implement [`DeserializeOwned`] as well as [`Serialize`] because
 /// the schema is discovered through the type's `Deserialize` impl.
@@ -205,6 +280,24 @@ where
     SelfDescribingSerializer::new(&schema).to_vec(value)
 }
 
+/// Serializes `value` into a self-describing blob using `T`'s compile-time
+/// schema from `#[derive(Schema)]` — no tracing pass, and the monomorphized
+/// columnar writer.
+///
+/// Produces byte-identical output to [`to_vec`].
+///
+/// # Errors
+///
+/// Fails if the value cannot be represented (e.g. a `serde(skip)` enum
+/// variant).
+pub fn to_vec_static<T>(value: &T) -> Result<Vec<u8>>
+where
+    T: SerializeColumns + ?Sized,
+{
+    let schema = T::schema();
+    SelfDescribingSerializer::new(&schema).to_vec_columns(value)
+}
+
 /// Deserializes a value from a self-describing blob produced by [`to_vec`]
 /// (or [`SelfDescribingSerializer`]).
 ///
@@ -216,5 +309,22 @@ pub fn from_slice<T>(input: &[u8]) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    SelfDescribingDeserializer::<T>::from_slice(input)
+    SelfDescribingDeserializer::<T>::new().from_slice(input)
+}
+
+/// Like [`from_slice`], but uses `T`'s compile-time schema from
+/// `#[derive(Schema)]` instead of tracing, so it also works for types that
+/// borrow from the input.
+///
+/// Still reconciles older schemas, exactly as [`from_slice`] does.
+///
+/// # Errors
+///
+/// Fails on malformed input or if the embedded schema cannot be reconciled
+/// with `T`.
+pub fn from_slice_static<'de, T>(input: &'de [u8]) -> Result<T>
+where
+    T: StaticSchema + Deserialize<'de>,
+{
+    SelfDescribingDeserializer::<T>::new_static().from_slice(input)
 }

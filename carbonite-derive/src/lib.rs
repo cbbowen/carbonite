@@ -1,22 +1,29 @@
-//! Derive macro for carbonite's `StaticSchema` trait.
+//! Derive macro for carbonite's compile-time schemas.
 //!
-//! `#[derive(Schema)]` generates a compile-time schema **identical** to what
-//! carbonite's runtime tracing would discover for the same type. To keep that
-//! guarantee it mirrors the serde attributes that affect the wire shape
-//! (`rename`, `rename_all`, `rename_all_fields`, `skip`, `transparent`) and
-//! rejects, at compile time, the ones carbonite cannot represent (`flatten`,
-//! `untagged`, `tag`/`content`, `with`, `from`/`into`, `skip_serializing_if`,
-//! and asymmetric skips).
+//! `#[derive(Schema)]` implements three traits: `StaticSchema` — a schema
+//! **identical** to what carbonite's runtime tracing would discover for the
+//! same type, plus its column count — and the `SerializeColumns` /
+//! `DeserializeColumns` fast paths over that layout.
+//!
+//! To keep the tracing-equivalence guarantee it mirrors the serde attributes
+//! that affect the wire shape (`rename`, `rename_all`, `rename_all_fields`,
+//! `skip`, `transparent`) and rejects, at compile time, the ones carbonite
+//! cannot represent (`flatten`, `untagged`, `tag`/`content`, `with`,
+//! `from`/`into`, `skip_serializing_if`, and asymmetric skips).
+//!
+//! `#[carbonite(crate = "...")]` points the generated code at a renamed
+//! carbonite dependency.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::meta::ParseNestedMeta;
-use syn::{Data, DeriveInput, Fields, Index, LitStr, Member, parse_macro_input, parse_quote};
+use syn::{Data, DeriveInput, Fields, Index, LitStr, Member, Path, parse_macro_input, parse_quote};
 
-/// Derives `carbonite::StaticSchema`: a compile-time schema matching what
-/// runtime tracing would produce.
-#[proc_macro_derive(Schema)]
+/// Derives `carbonite::StaticSchema` (a compile-time schema matching what
+/// runtime tracing would produce) along with the `SerializeColumns` and
+/// `DeserializeColumns` fast paths.
+#[proc_macro_derive(Schema, attributes(carbonite))]
 pub fn derive_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand(&input)
@@ -25,15 +32,22 @@ pub fn derive_schema(input: TokenStream) -> TokenStream {
 }
 
 fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
+    let krate = parse_crate_path(&input.attrs)?;
     let container = parse_container_attrs(&input.attrs)?;
     let name = container
         .rename
         .clone()
         .unwrap_or_else(|| strip_raw(&input.ident.to_string()));
 
-    let body = match &input.data {
-        Data::Struct(data) => expand_struct(input, &container, &name, &data.fields)?,
-        Data::Enum(data) => expand_enum(&container, &name, data)?,
+    let (body, parts) = match &input.data {
+        Data::Struct(data) => (
+            expand_struct(input, &container, &name, &data.fields, &krate)?,
+            columnar_struct_parts(&data.fields, &krate)?,
+        ),
+        Data::Enum(data) => (
+            expand_enum(&container, &name, data, &krate)?,
+            columnar_enum_parts(data, &krate)?,
+        ),
         Data::Union(u) => {
             return Err(syn::Error::new_spanned(
                 u.union_token,
@@ -45,23 +59,47 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     // Every type parameter needs a schema of its own.
     let mut generics = input.generics.clone();
     for param in generics.type_params_mut() {
-        param.bounds.push(parse_quote!(::carbonite::StaticSchema));
+        param.bounds.push(parse_quote!(#krate::StaticSchema));
     }
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let ident = &input.ident;
+    let columns = &parts.columns;
 
-    let columnar = columnar_impls(input)?;
+    let columnar = columnar_impls(input, &parts, &krate);
 
     Ok(quote! {
         #[automatically_derived]
-        impl #impl_generics ::carbonite::StaticSchema for #ident #ty_generics #where_clause {
-            fn schema_node() -> ::carbonite::SchemaNode {
+        impl #impl_generics #krate::StaticSchema for #ident #ty_generics #where_clause {
+            fn schema_node() -> #krate::SchemaNode {
                 #body
             }
+
+            const COLUMNS: usize = #columns;
         }
 
         #columnar
     })
+}
+
+/// Reads `#[carbonite(crate = "...")]`, defaulting to `::carbonite`.
+fn parse_crate_path(attrs: &[syn::Attribute]) -> syn::Result<Path> {
+    let mut path: Path = parse_quote!(::carbonite);
+    for attr in attrs {
+        if !attr.path().is_ident("carbonite") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("crate") {
+                path = meta.value()?.parse::<LitStr>()?.parse()?;
+                Ok(())
+            } else {
+                Err(meta.error(
+                    "unrecognized carbonite attribute; the only one is `crate = \"...\"`",
+                ))
+            }
+        })?;
+    }
+    Ok(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -71,40 +109,26 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 // compile-time constants. They must write byte-for-byte what carbonite's
 // serde-driven path writes, over the column layout of the generated
 // StaticSchema: columns depth-first, a node's own columns before its
-// children's.
+// children's. Both directions index off `StaticSchema::COLUMNS`, the single
+// declaration of a type's column count.
 // ---------------------------------------------------------------------------
 
 struct ColumnarParts {
-    ser_columns: TokenStream2,
+    /// The type's total column count, for `StaticSchema::COLUMNS`.
+    columns: TokenStream2,
     ser_body: TokenStream2,
-    de_columns: TokenStream2,
     de_body: TokenStream2,
 }
 
-fn columnar_impls(input: &DeriveInput) -> syn::Result<TokenStream2> {
-    let parts = match &input.data {
-        Data::Struct(data) => columnar_struct_parts(&data.fields)?,
-        Data::Enum(data) => columnar_enum_parts(data)?,
-        Data::Union(u) => {
-            return Err(syn::Error::new_spanned(
-                u.union_token,
-                "carbonite cannot derive Schema for unions",
-            ));
-        }
-    };
+fn columnar_impls(input: &DeriveInput, parts: &ColumnarParts, krate: &Path) -> TokenStream2 {
     let ColumnarParts {
-        ser_columns,
-        ser_body,
-        de_columns,
-        de_body,
+        ser_body, de_body, ..
     } = parts;
     let ident = &input.ident;
 
     let mut ser_generics = input.generics.clone();
     for param in ser_generics.type_params_mut() {
-        param
-            .bounds
-            .push(parse_quote!(::carbonite::SerializeColumns));
+        param.bounds.push(parse_quote!(#krate::SerializeColumns));
     }
     let (ser_impl_generics, ty_generics, ser_where) = ser_generics.split_for_impl();
 
@@ -114,7 +138,7 @@ fn columnar_impls(input: &DeriveInput) -> syn::Result<TokenStream2> {
     for param in de_generics.type_params_mut() {
         param
             .bounds
-            .push(parse_quote!(::carbonite::DeserializeColumns<'de>));
+            .push(parse_quote!(#krate::DeserializeColumns<'de>));
     }
     {
         let where_clause = de_generics.make_where_clause();
@@ -126,32 +150,28 @@ fn columnar_impls(input: &DeriveInput) -> syn::Result<TokenStream2> {
     de_generics.params.insert(0, parse_quote!('de));
     let (de_impl_generics, _, de_where) = de_generics.split_for_impl();
 
-    Ok(quote! {
+    quote! {
         #[automatically_derived]
-        impl #ser_impl_generics ::carbonite::SerializeColumns for #ident #ty_generics #ser_where {
-            const COLUMNS: usize = #ser_columns;
-
+        impl #ser_impl_generics #krate::SerializeColumns for #ident #ty_generics #ser_where {
             #[allow(unused_variables, unused_mut)]
             fn serialize_columns(
                 &self,
                 columns: &mut [::std::vec::Vec<u8>],
-            ) -> ::carbonite::Result<()> {
+            ) -> #krate::Result<()> {
                 #ser_body
             }
         }
 
         #[automatically_derived]
-        impl #de_impl_generics ::carbonite::DeserializeColumns<'de> for #ident #ty_generics #de_where {
-            const COLUMNS: usize = #de_columns;
-
+        impl #de_impl_generics #krate::DeserializeColumns<'de> for #ident #ty_generics #de_where {
             #[allow(unused_variables, unused_mut)]
             fn deserialize_columns(
-                cursors: &mut [::carbonite::columnar::ColumnCursor<'de>],
-            ) -> ::carbonite::Result<Self> {
+                cursors: &mut [#krate::ColumnCursor<'de>],
+            ) -> #krate::Result<Self> {
                 #de_body
             }
         }
-    })
+    }
 }
 
 struct FieldModel<'a> {
@@ -183,38 +203,31 @@ fn field_models(fields: &Fields) -> syn::Result<Vec<FieldModel<'_>>> {
         .collect()
 }
 
-fn ser_trait() -> TokenStream2 {
-    quote!(::carbonite::SerializeColumns)
-}
-
-fn de_trait() -> TokenStream2 {
-    quote!(::carbonite::DeserializeColumns<'de>)
-}
-
 /// `(0usize + <T0>::COLUMNS + <T1>::COLUMNS + ...)` over the given types.
-fn columns_expr(tys: &[&syn::Type], trait_path: &TokenStream2) -> TokenStream2 {
-    quote!((0usize #(+ <#tys as #trait_path>::COLUMNS)*))
+fn columns_expr(tys: &[&syn::Type], krate: &Path) -> TokenStream2 {
+    quote!((0usize #(+ <#tys as #krate::StaticSchema>::COLUMNS)*))
 }
 
-fn columnar_struct_parts(fields: &Fields) -> syn::Result<ColumnarParts> {
+/// `<T>::COLUMNS` for one type.
+fn type_columns(ty: &syn::Type, krate: &Path) -> TokenStream2 {
+    quote!(<#ty as #krate::StaticSchema>::COLUMNS)
+}
+
+fn columnar_struct_parts(fields: &Fields, krate: &Path) -> syn::Result<ColumnarParts> {
     let models = field_models(fields)?;
     let active_tys: Vec<&syn::Type> = models.iter().filter(|m| !m.skip).map(|m| m.ty).collect();
-    let ser_columns = columns_expr(&active_tys, &ser_trait());
-    let de_columns = columns_expr(&active_tys, &de_trait());
+    let columns = columns_expr(&active_tys, krate);
 
     let ser_steps: Vec<TokenStream2> = models
         .iter()
         .filter(|m| !m.skip)
         .map(|m| {
             let member = &m.member;
-            let ty = m.ty;
+            let width = type_columns(m.ty, krate);
             quote! {
-                ::carbonite::SerializeColumns::serialize_columns(
+                #krate::SerializeColumns::serialize_columns(
                     &self.#member,
-                    ::carbonite::columnar::__split(
-                        &mut __rest,
-                        <#ty as ::carbonite::SerializeColumns>::COLUMNS,
-                    ),
+                    #krate::columnar::__split(&mut __rest, #width),
                 )?;
             }
         })
@@ -234,12 +247,10 @@ fn columnar_struct_parts(fields: &Fields) -> syn::Result<ColumnarParts> {
         } else {
             let tmp = format_ident!("__field{index}");
             let ty = m.ty;
+            let width = type_columns(ty, krate);
             reads.push(quote! {
-                let #tmp = <#ty as ::carbonite::DeserializeColumns<'de>>::deserialize_columns(
-                    ::carbonite::columnar::__split(
-                        &mut __rest,
-                        <#ty as ::carbonite::DeserializeColumns<'de>>::COLUMNS,
-                    ),
+                let #tmp = <#ty as #krate::DeserializeColumns<'de>>::deserialize_columns(
+                    #krate::columnar::__split(&mut __rest, #width),
                 )?;
             });
             values.push(quote!(#tmp));
@@ -253,9 +264,8 @@ fn columnar_struct_parts(fields: &Fields) -> syn::Result<ColumnarParts> {
     };
 
     Ok(ColumnarParts {
-        ser_columns,
+        columns,
         ser_body,
-        de_columns,
         de_body,
     })
 }
@@ -271,7 +281,7 @@ fn constructor(fields: &Fields, models: &[FieldModel], values: &[TokenStream2]) 
     }
 }
 
-fn columnar_enum_parts(data: &syn::DataEnum) -> syn::Result<ColumnarParts> {
+fn columnar_enum_parts(data: &syn::DataEnum, krate: &Path) -> syn::Result<ColumnarParts> {
     let mut active = Vec::new();
     let mut skipped = Vec::new();
     for variant in &data.variants {
@@ -284,47 +294,38 @@ fn columnar_enum_parts(data: &syn::DataEnum) -> syn::Result<ColumnarParts> {
 
     // Per-variant column-count expressions, and each variant's offset past
     // the tag column and all preceding variants' columns. All const.
-    let per_variant = |trait_path: &TokenStream2| -> (Vec<TokenStream2>, Vec<TokenStream2>) {
-        let counts: Vec<TokenStream2> = active
-            .iter()
-            .map(|(_, models)| {
-                let tys: Vec<&syn::Type> =
-                    models.iter().filter(|m| !m.skip).map(|m| m.ty).collect();
-                columns_expr(&tys, trait_path)
-            })
-            .collect();
-        let offsets = (0..active.len())
-            .map(|k| {
-                let preceding = &counts[..k];
-                quote!((1usize #(+ #preceding)*))
-            })
-            .collect();
-        (counts, offsets)
-    };
-    let (ser_counts, ser_offsets) = per_variant(&ser_trait());
-    let (de_counts, de_offsets) = per_variant(&de_trait());
-    let ser_columns = quote!((1usize #(+ #ser_counts)*));
-    let de_columns = quote!((1usize #(+ #de_counts)*));
+    let counts: Vec<TokenStream2> = active
+        .iter()
+        .map(|(_, models)| {
+            let tys: Vec<&syn::Type> = models.iter().filter(|m| !m.skip).map(|m| m.ty).collect();
+            columns_expr(&tys, krate)
+        })
+        .collect();
+    let offsets: Vec<TokenStream2> = (0..active.len())
+        .map(|k| {
+            let preceding = &counts[..k];
+            quote!((1usize #(+ #preceding)*))
+        })
+        .collect();
+    let columns = quote!((1usize #(+ #counts)*));
 
     let mut ser_arms = Vec::new();
     for (k, (variant, models)) in active.iter().enumerate() {
         let tag = k as u64;
-        let offset = &ser_offsets[k];
+        let offset = &offsets[k];
         let (pattern, bindings) = variant_pattern(&variant.ident, &variant.fields, models);
         let steps = bindings.iter().map(|(binding, ty)| {
+            let width = type_columns(ty, krate);
             quote! {
-                ::carbonite::SerializeColumns::serialize_columns(
+                #krate::SerializeColumns::serialize_columns(
                     #binding,
-                    ::carbonite::columnar::__split(
-                        &mut __rest,
-                        <#ty as ::carbonite::SerializeColumns>::COLUMNS,
-                    ),
+                    #krate::columnar::__split(&mut __rest, #width),
                 )?;
             }
         });
         ser_arms.push(quote! {
             #pattern => {
-                ::carbonite::columnar::write_varint(&mut columns[0usize], #tag);
+                #krate::columnar::write_varint(&mut columns[0usize], #tag);
                 let mut __rest = &mut columns[#offset..];
                 #(#steps)*
                 ::core::result::Result::Ok(())
@@ -335,7 +336,7 @@ fn columnar_enum_parts(data: &syn::DataEnum) -> syn::Result<ColumnarParts> {
         let name = strip_raw(&ident.to_string());
         ser_arms.push(quote! {
             Self::#ident { .. } => ::core::result::Result::Err(
-                ::carbonite::columnar::__skipped_variant(#name),
+                #krate::columnar::__skipped_variant(#name),
             )
         });
     }
@@ -348,7 +349,7 @@ fn columnar_enum_parts(data: &syn::DataEnum) -> syn::Result<ColumnarParts> {
     let mut de_arms = Vec::new();
     for (k, (variant, models)) in active.iter().enumerate() {
         let tag = k as u64;
-        let offset = &de_offsets[k];
+        let offset = &offsets[k];
         let vident = &variant.ident;
         let mut reads = Vec::new();
         let mut values = Vec::new();
@@ -358,12 +359,10 @@ fn columnar_enum_parts(data: &syn::DataEnum) -> syn::Result<ColumnarParts> {
             } else {
                 let tmp = format_ident!("__field{index}");
                 let ty = m.ty;
+                let width = type_columns(ty, krate);
                 reads.push(quote! {
-                    let #tmp = <#ty as ::carbonite::DeserializeColumns<'de>>::deserialize_columns(
-                        ::carbonite::columnar::__split(
-                            &mut __rest,
-                            <#ty as ::carbonite::DeserializeColumns<'de>>::COLUMNS,
-                        ),
+                    let #tmp = <#ty as #krate::DeserializeColumns<'de>>::deserialize_columns(
+                        #krate::columnar::__split(&mut __rest, #width),
                     )?;
                 });
                 values.push(quote!(#tmp));
@@ -390,15 +389,14 @@ fn columnar_enum_parts(data: &syn::DataEnum) -> syn::Result<ColumnarParts> {
         match __tag {
             #(#de_arms,)*
             __other => ::core::result::Result::Err(
-                ::carbonite::columnar::__invalid_variant(__other),
+                #krate::columnar::__invalid_variant(__other),
             ),
         }
     };
 
     Ok(ColumnarParts {
-        ser_columns,
+        columns,
         ser_body,
-        de_columns,
         de_body,
     })
 }
@@ -453,6 +451,7 @@ fn expand_struct(
     container: &ContainerAttrs,
     name: &str,
     fields: &Fields,
+    krate: &Path,
 ) -> syn::Result<TokenStream2> {
     if container.transparent {
         let mut tys = Vec::new();
@@ -479,40 +478,40 @@ fn expand_struct(
                 "serde(transparent) requires exactly one non-skipped field",
             ));
         };
-        return Ok(quote!(<#ty as ::carbonite::StaticSchema>::schema_node()));
+        return Ok(quote!(<#ty as #krate::StaticSchema>::schema_node()));
     }
 
     match fields {
         Fields::Unit => Ok(quote! {
-            ::carbonite::SchemaNode::UnitStruct { name: #name.to_owned() }
+            #krate::SchemaNode::UnitStruct { name: #name.to_owned() }
         }),
         Fields::Unnamed(unnamed) => {
             let tys = unnamed_field_types(unnamed)?;
             if unnamed.unnamed.len() == 1 && tys.len() == 1 {
                 let ty = tys[0];
                 Ok(quote! {
-                    ::carbonite::SchemaNode::NewtypeStruct {
+                    #krate::SchemaNode::NewtypeStruct {
                         name: #name.to_owned(),
                         inner: ::std::boxed::Box::new(
-                            <#ty as ::carbonite::StaticSchema>::schema_node(),
+                            <#ty as #krate::StaticSchema>::schema_node(),
                         ),
                     }
                 })
             } else {
                 Ok(quote! {
-                    ::carbonite::SchemaNode::TupleStruct {
+                    #krate::SchemaNode::TupleStruct {
                         name: #name.to_owned(),
                         fields: ::std::vec![
-                            #(<#tys as ::carbonite::StaticSchema>::schema_node()),*
+                            #(<#tys as #krate::StaticSchema>::schema_node()),*
                         ],
                     }
                 })
             }
         }
         Fields::Named(named) => {
-            let entries = named_field_entries(named, container.rename_all)?;
+            let entries = named_field_entries(named, container.rename_all, krate)?;
             Ok(quote! {
-                ::carbonite::SchemaNode::Struct {
+                #krate::SchemaNode::Struct {
                     name: #name.to_owned(),
                     fields: ::std::vec![#(#entries),*],
                 }
@@ -525,6 +524,7 @@ fn expand_enum(
     container: &ContainerAttrs,
     name: &str,
     data: &syn::DataEnum,
+    krate: &Path,
 ) -> syn::Result<TokenStream2> {
     let mut entries = Vec::new();
     for variant in &data.variants {
@@ -543,33 +543,33 @@ fn expand_enum(
         // rename_all wins over container-level rename_all_fields.
         let field_rule = attrs.rename_all.or(container.rename_all_fields);
         let shape = match &variant.fields {
-            Fields::Unit => quote!(::carbonite::VariantNode::Unit),
+            Fields::Unit => quote!(#krate::VariantNode::Unit),
             Fields::Unnamed(unnamed) => {
                 let tys = unnamed_field_types(unnamed)?;
                 if unnamed.unnamed.len() == 1 && tys.len() == 1 {
                     let ty = tys[0];
                     quote! {
-                        ::carbonite::VariantNode::Newtype(::std::boxed::Box::new(
-                            <#ty as ::carbonite::StaticSchema>::schema_node(),
+                        #krate::VariantNode::Newtype(::std::boxed::Box::new(
+                            <#ty as #krate::StaticSchema>::schema_node(),
                         ))
                     }
                 } else {
                     quote! {
-                        ::carbonite::VariantNode::Tuple(::std::vec![
-                            #(<#tys as ::carbonite::StaticSchema>::schema_node()),*
+                        #krate::VariantNode::Tuple(::std::vec![
+                            #(<#tys as #krate::StaticSchema>::schema_node()),*
                         ])
                     }
                 }
             }
             Fields::Named(named) => {
-                let fields = named_field_entries(named, field_rule)?;
-                quote!(::carbonite::VariantNode::Struct(::std::vec![#(#fields),*]))
+                let fields = named_field_entries(named, field_rule, krate)?;
+                quote!(#krate::VariantNode::Struct(::std::vec![#(#fields),*]))
             }
         };
         entries.push(quote!((#variant_name.to_owned(), #shape)));
     }
     Ok(quote! {
-        ::carbonite::SchemaNode::Enum {
+        #krate::SchemaNode::Enum {
             name: #name.to_owned(),
             variants: ::std::vec![#(#entries),*],
         }
@@ -579,6 +579,7 @@ fn expand_enum(
 fn named_field_entries(
     fields: &syn::FieldsNamed,
     rule: Option<RenameRule>,
+    krate: &Path,
 ) -> syn::Result<Vec<TokenStream2>> {
     let mut entries = Vec::new();
     for field in &fields.named {
@@ -593,7 +594,7 @@ fn named_field_entries(
         });
         let ty = &field.ty;
         entries.push(quote! {
-            (#name.to_owned(), <#ty as ::carbonite::StaticSchema>::schema_node())
+            (#name.to_owned(), <#ty as #krate::StaticSchema>::schema_node())
         });
     }
     Ok(entries)
@@ -870,7 +871,7 @@ fn uncapitalize_first(s: &str) -> String {
 fn pascal_to_snake(variant: &str) -> String {
     let mut out = String::with_capacity(variant.len() + 2);
     for (i, ch) in variant.char_indices() {
-        if ch.is_ascii_uppercase() && i > 0 {
+        if i > 0 && ch.is_uppercase() {
             out.push('_');
         }
         out.push(ch.to_ascii_lowercase());

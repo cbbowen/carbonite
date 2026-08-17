@@ -30,9 +30,34 @@ pub enum Error {
     /// A string column contained invalid UTF-8.
     #[error("invalid utf-8 in string data")]
     InvalidUtf8,
-    /// A varint was malformed or overflowed 64 bits.
+    /// A varint was malformed, non-canonical, or overflowed 64 bits.
     #[error("invalid varint")]
     InvalidVarint,
+    /// A length or count in the input claimed more than the remaining data
+    /// could possibly encode, or exceeded a hard decoding limit.
+    ///
+    /// carbonite validates every length against the bytes actually present
+    /// before acting on it, so a corrupt or hostile blob cannot drive an
+    /// allocation or a loop out of proportion to its own size.
+    #[error("{what} of {claimed} exceeds the limit of {limit}")]
+    LimitExceeded {
+        /// What was being sized (`"row count"`, `"sequence length"`, …).
+        what: &'static str,
+        /// The count the input claimed.
+        claimed: u64,
+        /// The largest count this input could justify.
+        limit: u64,
+    },
+    /// The input was written by a newer carbonite than this one.
+    #[error("unsupported {what} version {found} (this build supports up to {supported})")]
+    UnsupportedVersion {
+        /// Which version marker was out of range (`"schema"`, `"frame"`).
+        what: &'static str,
+        /// The version the input declared.
+        found: u64,
+        /// The newest version this build understands.
+        supported: u64,
+    },
     /// A tag, presence byte, or char value was out of range.
     #[error("invalid {what} value {value}")]
     InvalidTag {
