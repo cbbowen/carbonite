@@ -184,9 +184,11 @@ pub fn __skipped_variant(name: &'static str) -> Error {
     ))
 }
 
-/// Cap for length-hint preallocation, so a valid but large count can't
-/// trigger one enormous reservation up front.
-const CAUTIOUS_CAPACITY: usize = 4096;
+/// Byte budget for speculative preallocation, mirroring serde's own caution.
+/// A validated count still has only a one-byte-per-element floor behind it,
+/// so trusting it to size a reservation would let a blob demand an allocation
+/// `size_of::<T>()` times larger than itself.
+const MAX_PREALLOC_BYTES: usize = 1 << 20;
 
 /// Largest repetition count accepted for a value that occupies no columns.
 ///
@@ -230,13 +232,18 @@ pub fn checked_count(
     usize::try_from(claimed).map_err(|_| Error::Malformed("length overflows usize"))
 }
 
-/// Preallocation bound for a count already validated by [`checked_count`].
+/// Preallocation bound for a count already validated by [`read_count`].
 #[inline]
-fn cautious_capacity(element_columns: usize, len: usize) -> usize {
-    if element_columns == 0 {
-        len.min(CAUTIOUS_CAPACITY)
-    } else {
+fn cautious_capacity<T: StaticSchema>(len: usize) -> usize {
+    if T::FIXED_WIDTH.is_some() {
+        // The count was bounded by the element's exact byte width, so the
+        // reservation cannot outgrow the input.
         len
+    } else {
+        // The generic bound is one byte per element; reserve at most a
+        // budget's worth and let the vector grow to the real length as
+        // elements actually decode.
+        len.min(MAX_PREALLOC_BYTES / std::mem::size_of::<T>().max(1))
     }
 }
 
@@ -248,6 +255,21 @@ fn read_count<T: ?Sized + StaticSchema>(
     elements: &[ColumnCursor<'_>],
 ) -> Result<usize> {
     let claimed = len_column.varint()?;
+    // A fixed-width element consumes exactly `width` bytes of its single
+    // column, so the bound is exact rather than the one-byte floor
+    // `checked_count` falls back on.
+    if let Some(width) = T::FIXED_WIDTH {
+        let available = elements.first().map_or(0, ColumnCursor::remaining);
+        let limit = (available / width) as u64;
+        if claimed > limit {
+            return Err(Error::LimitExceeded {
+                what,
+                claimed,
+                limit,
+            });
+        }
+        return usize::try_from(claimed).map_err(|_| Error::Malformed("length overflows usize"));
+    }
     checked_count(what, T::columns(), claimed, elements)
 }
 
@@ -528,7 +550,7 @@ impl<'de, T: DeserializeColumns<'de>> DeserializeColumns<'de> for Vec<T> {
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         let (len_column, elems) = cursors.split_at_mut(1);
         let len = read_count::<T>("sequence length", &mut len_column[0], elems)?;
-        let mut out = Vec::with_capacity(cautious_capacity(T::columns(), len));
+        let mut out = Vec::with_capacity(cautious_capacity::<T>(len));
         for _ in 0..len {
             out.push(T::deserialize_columns(&mut *elems)?);
         }

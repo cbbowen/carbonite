@@ -51,7 +51,17 @@ variant of every enum is exercised at least once") if the fix is not exact.
 
 ## 2. Columnar preallocation amplifies input by `size_of::<T>()`
 
-**Hardening gap.** `checked_count` (`src/columnar.rs`) bounds a claimed count
+**Status: fixed.** `read_count` now bounds fixed-width elements by
+`remaining / width` (exact, via `StaticSchema::FIXED_WIDTH`), and
+`cautious_capacity` caps the speculative reservation for everything else at a
+`MAX_PREALLOC_BYTES` budget, serde-style — the vector still grows to the real
+length as elements decode. Collection `collect()`s were already safe: std's
+`Result`-collecting adapter reports a zero lower bound, so they never
+preallocated from the claim. Hardening tests:
+`fixed_width_sequence_counts_are_bounded_by_the_element_width` and
+`wide_element_claims_fail_cleanly_without_a_matching_reservation`.
+
+**Original finding.** `checked_count` (`src/columnar.rs`) bounds a claimed count
 by *total remaining bytes* — a floor of one byte per element — and
 `Vec<T>::deserialize_columns` then does `Vec::with_capacity(len)`. A hostile
 blob paying one byte per claimed element gets an upfront allocation of

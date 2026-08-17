@@ -299,3 +299,68 @@ fn truncation_and_corruption_stay_clean() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Preallocation amplification. The generic count bound is one byte per
+// element, while a decoded element occupies size_of::<T>() — so the columnar
+// reader must not turn a small blob into a reservation many times its size.
+// ---------------------------------------------------------------------------
+
+/// A fixed-width element consumes exactly its width, so the count check is
+/// exact: 32 bytes of `u128` data justify two elements and not three.
+#[test]
+fn fixed_width_sequence_counts_are_bounded_by_the_element_width() {
+    let mut len_col = Vec::new();
+    varint(&mut len_col, 3);
+    let data_col = vec![0u8; 32]; // two u128s
+
+    let input = blob(1, &[len_col, data_col]);
+    let de = Deserializer::new_static(Vec::<u128>::schema());
+    match de.from_slice_columns(&input) {
+        Err(Error::LimitExceeded {
+            claimed: 3,
+            limit: 2,
+            ..
+        }) => {}
+        other => panic!("expected the exact-width bound, got {other:?}"),
+    }
+
+    // The same bytes with an honest count decode.
+    let mut len_col = Vec::new();
+    varint(&mut len_col, 2);
+    let input = blob(1, &[len_col, vec![0u8; 32]]);
+    assert_eq!(de.from_slice_columns(&input).unwrap(), vec![0u128, 0]);
+}
+
+/// A wide element type without a fixed width keeps the one-byte-per-element
+/// floor, so the claim itself passes — the reservation must be capped by
+/// budget instead of trusting it. A huge claim with almost no bytes still
+/// fails fast and cleanly, without an allocation proportional to the claim.
+#[test]
+fn wide_element_claims_fail_cleanly_without_a_matching_reservation() {
+    #[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug)]
+    struct Wide {
+        a: u128,
+        b: u128,
+        c: u128,
+        d: u128,
+    }
+
+    // Four bytes per element column: sixteen remaining bytes let the generic
+    // floor accept a claim of 16 elements, which would decode to 1 KiB —
+    // nowhere near what the bytes can actually satisfy.
+    let mut len_col = Vec::new();
+    varint(&mut len_col, 16);
+    let mut columns = vec![len_col];
+    columns.extend(std::iter::repeat_n(
+        vec![0u8; 4],
+        Vec::<Wide>::columns() - 1,
+    ));
+
+    let input = blob(1, &columns);
+    let de = Deserializer::new_static(Vec::<Wide>::schema());
+    match de.from_slice_columns(&input) {
+        Err(Error::UnexpectedEof) => {}
+        other => panic!("expected a clean decode failure, got {other:?}"),
+    }
+}
