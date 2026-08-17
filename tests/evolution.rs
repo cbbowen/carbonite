@@ -238,3 +238,373 @@ fn self_describing_blobs_evolve_too() {
         }
     );
 }
+
+// ---------------------------------------------------------------------------
+// The properties the README's evolution table claims, one test per row.
+//
+// Shape changes — a field group moving between positional and named form —
+// have their own rule and their own file; see `tests/shape_evolution.rs`.
+// ---------------------------------------------------------------------------
+
+/// Writes `value` with its own schema and reads it back as `U`, the way a file
+/// or message written by an older build arrives.
+fn migrate<T, U>(value: &T) -> Result<U, carbonite::Error>
+where
+    T: Serialize + serde::de::DeserializeOwned,
+    U: serde::de::DeserializeOwned,
+{
+    let schema = Schema::<T>::new()?;
+    let blob = Serializer::new(&schema).to_vec(value)?;
+    let reader = Schema::<U>::from_bytes(&schema.to_bytes())?;
+    Deserializer::new(reader).from_slice(&blob)
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct Field {
+    a: u32,
+    b: String,
+}
+
+fn field() -> Field {
+    Field {
+        a: 7,
+        b: "hi".to_owned(),
+    }
+}
+
+// --- fields ----------------------------------------------------------------
+
+#[test]
+fn a_renamed_field_without_an_alias_is_reported() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Renamed {
+        a: u32,
+        label: String,
+    }
+
+    let err = migrate::<_, Renamed>(&field()).unwrap_err();
+    assert!(err.to_string().contains("label"), "{err}");
+}
+
+/// Widening is always safe. Narrowing is **value-dependent**: it succeeds for
+/// values that fit and fails for those that do not, so a narrowing change can
+/// pass every test and still reject production data.
+#[test]
+fn narrowing_an_integer_depends_on_the_value() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Narrow {
+        a: u8,
+        b: String,
+    }
+
+    assert_eq!(
+        migrate::<_, Narrow>(&field()).unwrap(),
+        Narrow {
+            a: 7,
+            b: "hi".to_owned()
+        }
+    );
+    let err = migrate::<_, Narrow>(&Field {
+        a: 999,
+        b: "hi".to_owned(),
+    })
+    .unwrap_err();
+    assert!(err.to_string().contains("999"), "{err}");
+}
+
+/// Wrapping in `Option` is a one-way door: old data reads as `Some`, but an
+/// `Option` file cannot be read back into a bare field, even where it holds a
+/// value.
+#[test]
+fn unwrapping_an_option_is_not_supported() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Optioned {
+        a: Option<u32>,
+        b: String,
+    }
+
+    assert!(
+        migrate::<_, Field>(&Optioned {
+            a: Some(7),
+            b: "hi".to_owned()
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn changing_a_fields_type_is_reported() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Retyped {
+        a: String,
+        b: String,
+    }
+
+    assert!(migrate::<_, Retyped>(&field()).is_err());
+}
+
+/// Forward compatibility: a build that predates a field still reads data
+/// written with it, because the extra column is skipped.
+#[test]
+fn an_older_reader_skips_a_field_it_does_not_know() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Extended {
+        a: u32,
+        b: String,
+        c: u8,
+    }
+
+    assert_eq!(
+        migrate::<_, Field>(&Extended {
+            a: 7,
+            b: "hi".to_owned(),
+            c: 1
+        })
+        .unwrap(),
+        field()
+    );
+}
+
+/// Wrapping a field's type in a newtype struct is a no-op on the wire — a
+/// `NewtypeStruct` occupies exactly its inner value's columns — but is not
+/// currently reconciled in either direction.
+#[test]
+fn wrapping_a_field_in_a_newtype_is_not_supported() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Meters(u32);
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Plain {
+        d: u32,
+    }
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Wrapped {
+        d: Meters,
+    }
+
+    assert!(migrate::<_, Wrapped>(&Plain { d: 5 }).is_err());
+    assert!(migrate::<_, Plain>(&Wrapped { d: Meters(5) }).is_err());
+}
+
+#[test]
+fn a_unit_struct_and_an_empty_struct_are_not_interchangeable() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Unit;
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Empty {}
+
+    assert!(migrate::<_, Empty>(&Unit).is_err());
+    assert!(migrate::<_, Unit>(&Empty {}).is_err());
+}
+
+// --- enum variants ---------------------------------------------------------
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+enum Tool {
+    Sword,
+    Bow { range: u32 },
+}
+
+/// The tag on the wire indexes the *writer's* variant list and is resolved to
+/// a name before matching, so where a variant sits is not part of the
+/// contract: one can be inserted anywhere, including ahead of existing ones.
+#[test]
+fn a_variant_can_be_added_anywhere_in_the_list() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    enum AddedFirst {
+        Wand(u8),
+        Sword,
+        Bow { range: u32 },
+    }
+
+    assert_eq!(
+        migrate::<_, AddedFirst>(&Tool::Sword).unwrap(),
+        AddedFirst::Sword
+    );
+    assert_eq!(
+        migrate::<_, AddedFirst>(&Tool::Bow { range: 12 }).unwrap(),
+        AddedFirst::Bow { range: 12 }
+    );
+}
+
+#[test]
+fn variants_can_be_reordered() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    enum Reordered {
+        Bow { range: u32 },
+        Sword,
+    }
+
+    assert_eq!(
+        migrate::<_, Reordered>(&Tool::Sword).unwrap(),
+        Reordered::Sword
+    );
+    assert_eq!(
+        migrate::<_, Reordered>(&Tool::Bow { range: 12 }).unwrap(),
+        Reordered::Bow { range: 12 }
+    );
+}
+
+#[test]
+fn a_renamed_variant_needs_an_alias() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    enum NoAlias {
+        Blade,
+        Bow { range: u32 },
+    }
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    enum WithAlias {
+        #[serde(alias = "Sword")]
+        Blade,
+        Bow {
+            range: u32,
+        },
+    }
+
+    assert!(migrate::<_, NoAlias>(&Tool::Sword).is_err());
+    assert_eq!(
+        migrate::<_, WithAlias>(&Tool::Sword).unwrap(),
+        WithAlias::Blade
+    );
+}
+
+/// Removing a variant only breaks the data that actually used it.
+#[test]
+fn a_removed_variant_only_affects_its_own_values() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    enum Fewer {
+        Bow { range: u32 },
+    }
+
+    assert_eq!(
+        migrate::<_, Fewer>(&Tool::Bow { range: 12 }).unwrap(),
+        Fewer::Bow { range: 12 }
+    );
+    let err = migrate::<_, Fewer>(&Tool::Sword).unwrap_err();
+    assert!(err.to_string().contains("Sword"), "{err}");
+}
+
+/// The counterpart of skipping an unknown *field*: an unknown *variant* has no
+/// meaning to fall back on, so it is reported.
+#[test]
+fn an_older_reader_reports_a_variant_it_does_not_know() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    enum More {
+        Sword,
+        Bow { range: u32 },
+        Wand(u8),
+    }
+
+    assert_eq!(migrate::<_, Tool>(&More::Sword).unwrap(), Tool::Sword);
+    let err = migrate::<_, Tool>(&More::Wand(3)).unwrap_err();
+    assert!(err.to_string().contains("Wand"), "{err}");
+}
+
+/// A variant may gain or lose *fields*, but not change between having a
+/// payload and not having one: a unit variant stores no columns to read a
+/// payload from, and `#[serde(default)]` has no say in it.
+#[test]
+fn a_variant_cannot_gain_or_lose_its_payload() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    enum Unit {
+        A,
+        B,
+    }
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    enum Newtype {
+        A(u8),
+        B,
+    }
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    enum Defaulted {
+        A(#[serde(default)] u8),
+        B,
+    }
+
+    assert!(migrate::<_, Newtype>(&Unit::A).is_err());
+    assert!(migrate::<_, Defaulted>(&Unit::A).is_err());
+    assert!(migrate::<_, Unit>(&Newtype::A(3)).is_err());
+}
+
+// --- containers ------------------------------------------------------------
+
+#[test]
+fn a_sequence_element_evolves_like_any_other_value() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Old {
+        items: Vec<Field>,
+    }
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct ItemNew {
+        a: u32,
+        b: String,
+        #[serde(default)]
+        c: u8,
+    }
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct New {
+        items: Vec<ItemNew>,
+    }
+
+    assert_eq!(
+        migrate::<_, New>(&Old {
+            items: vec![field()]
+        })
+        .unwrap(),
+        New {
+            items: vec![ItemNew {
+                a: 7,
+                b: "hi".to_owned(),
+                c: 0
+            }]
+        }
+    );
+}
+
+#[test]
+fn a_vec_and_a_fixed_array_are_interchangeable() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Dynamic {
+        items: Vec<u32>,
+    }
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Fixed {
+        items: [u32; 2],
+    }
+
+    assert_eq!(
+        migrate::<_, Fixed>(&Dynamic { items: vec![1, 2] }).unwrap(),
+        Fixed { items: [1, 2] }
+    );
+    assert_eq!(
+        migrate::<_, Dynamic>(&Fixed { items: [1, 2] }).unwrap(),
+        Dynamic { items: vec![1, 2] }
+    );
+}
+
+// --- which read path handles evolution -------------------------------------
+
+/// The columnar fast path decodes against the type's own schema and nothing
+/// else, so evolution is the serde path's job. This is the error that says
+/// which one you are on.
+#[test]
+fn evolution_belongs_to_the_serde_path() {
+    #[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug)]
+    struct Old {
+        a: u32,
+    }
+    #[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug)]
+    struct New {
+        a: u32,
+        #[serde(default)]
+        b: u8,
+    }
+
+    let schema = Schema::<Old>::new().unwrap();
+    let blob = Serializer::new(&schema).to_vec(&Old { a: 1 }).unwrap();
+    let reader = Schema::<New>::from_bytes(&schema.to_bytes()).unwrap();
+    let de: Deserializer<New> = Deserializer::new(reader);
+
+    assert!(!de.uses_fast_path());
+    assert!(de.from_slice_columns(&blob).is_err());
+    assert_eq!(de.from_slice(&blob).unwrap(), New { a: 1, b: 0 });
+}

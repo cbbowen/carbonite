@@ -17,7 +17,8 @@ self-describing format with the size and speed of a binary one:
 
 - **Evolvable**: old files are reconciled against the current type by field name at read
   time — `#[serde(default)]`, `#[serde(alias)]`, reordering, removed fields, and integer
-  widening all just work, with JSON's exact semantics.
+  widening all just work, with JSON's semantics, plus tuple-to-named field groups that JSON
+  cannot express. See [what you can change](#what-you-can-change).
 - **Compressible**: columnar layout is what compressors love — ~33% smaller than postcard
   after deflate on mixed workloads.
 - **Fast**: the derive generates monomorphized column readers/writers (no per-value schema
@@ -114,6 +115,101 @@ let old_file = carbonite::to_vec(&SaveV1 { name: "Ada".into(), hp: 90 }).unwrap(
 let save: Save = carbonite::from_slice(&old_file).unwrap();
 assert_eq!(save, Save { title: "Ada".into(), hp: 90, mana: 0 });
 ```
+
+## What you can change
+
+Every row below is a test in `tests/evolution.rs` or `tests/shape_evolution.rs`.
+
+**Fields**
+
+| Change | | Needs |
+| --- | --- | --- |
+| Add a field | ✓ | `#[serde(default)]` |
+| Remove a field | ✓ | — |
+| Reorder fields | ✓ | — |
+| Rename a field | ✓ | `#[serde(alias = "old")]` |
+| Widen an integer (`u32` → `u64`) | ✓ | — |
+| Narrow an integer (`u64` → `u32`) | ⚠ | succeeds only for values that fit |
+| Wrap a field in `Option` | ✓ | — (old values read as `Some`) |
+| Unwrap an `Option` | ✗ | |
+| Change a field's type | ✗ | |
+| Wrap a field's type in a newtype struct | ✗ | |
+
+**Enum variants**
+
+| Change | | Needs |
+| --- | --- | --- |
+| Add a variant, anywhere in the list | ✓ | — |
+| Reorder variants | ✓ | — |
+| Rename a variant | ✓ | `#[serde(alias = "Old")]` |
+| Remove a variant | ✓ | — (data that used it is reported) |
+| Add or remove a variant's fields | ✓ | as for struct fields |
+| Give a unit variant a payload, or take one away | ✗ | |
+
+The tag on the wire indexes the *writer's* variant list and is resolved to a name before
+matching, so where a variant sits is not part of the contract.
+
+**Positional and named field groups**
+
+A tuple, tuple struct, tuple variant, and newtype are all a product of fields in declaration
+order, so they can become named ones — but only if the reader says which position each field
+replaces:
+
+```rust
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, carbonite::Schema)]
+struct PointV1(f32, f32);
+
+#[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug)]
+struct Point {
+    #[serde(alias = "1")]
+    y: f32,
+    #[serde(alias = "0")]
+    x: f32,
+}
+
+let old_file = carbonite::to_vec(&PointV1(1.0, 2.0)).unwrap();
+let point: Point = carbonite::from_slice(&old_file).unwrap();
+assert_eq!(point, Point { y: 2.0, x: 1.0 });
+```
+
+| Change | | Needs |
+| --- | --- | --- |
+| Tuple struct or tuple variant → named fields | ✓ | `#[serde(alias = "0")]`, … |
+| Newtype struct or variant → named fields | ✓ | `#[serde(alias = "0")]` |
+| Named fields → tuple, tuple struct, or newtype | ✗ | |
+| Grow a tuple struct or tuple variant | ✓ | `#[serde(default)]` on the new field |
+| Grow a bare `(A, B)` tuple | ✗ | use a tuple struct |
+| Shrink any of them | ✓ | — |
+
+Without the tags the change is refused rather than matched by declaration order, because that
+would not **compose**: reordering named fields is already a no-op, so `V0(f32, f32)` →
+`V1 { x, y }` followed by `V1 { x, y }` → `V2 { y, x }` would decode a V0 file into a V2 with
+its values silently swapped. The reverse direction cannot be rescued at all — a tuple has
+nowhere to put the tag — so it is refused outright. One tag opts the whole reader in: an
+untagged field is then reported as missing rather than filled from whatever lined up, and a
+position the reader stops naming is dropped.
+
+**Containers**
+
+`Vec<T>` and `[T; N]` are interchangeable, and an element type evolves by the rules above.
+
+**Three things worth knowing**
+
+*Old readers are not symmetric.* A build that predates a field reads new data fine — the extra
+column is skipped. A build that predates a *variant* cannot: there is no meaning to fall back
+on, so it is reported.
+
+*Evolution is the serde path's job.* `Deserializer::from_slice` reconciles; the columnar fast
+path `from_slice_columns` decodes against the type's own schema and nothing else, and returns
+`Error::SchemaMismatch` for anything older. `uses_fast_path()` says which one you are on.
+
+*`#[serde(alias)]` makes a type untraceable.* serde reports aliases and the real name in one
+list with nothing marking which is which, and the schema records the name the type *writes*,
+so `Schema::<T>::new()` cannot recover it and says so. Since renaming and every
+positional-to-named change need an alias, a migrated type is derive-only for writing: put
+`#[derive(carbonite::Schema)]` on it and use `T::schema()`. Reading is unaffected.
 
 ## Types represented as another type
 
@@ -272,8 +368,9 @@ The data layer is not self-describing, so serde features that require one are un
 and fail with clear errors (the same class of restriction as bincode/postcard):
 `#[serde(untagged)]`, internally/adjacently tagged enums, `#[serde(flatten)]`, and
 `deserialize_any`-based types. Recursive types and `#[serde(skip_serializing_if)]` are
-rejected. Adding a field requires `#[serde(default)]` to read old data. Shared-value
-dedup is per row and per field position; cyclic values error on read.
+rejected. Shared-value dedup is per row and per field position; cyclic values error on read.
+Which changes to a type old data survives — and what each one needs — is
+[its own section](#what-you-can-change).
 
 ## Compatibility and untrusted input
 
