@@ -2,7 +2,7 @@
 //!
 //! carbonite splits a serialized value into two parts:
 //!
-//! - a **[`Schema<T>`]**, a serializable description of how `T` is laid out,
+//! - a **[`struct@Schema<T>`]**, a serializable description of how `T` is laid out,
 //!   discovered at runtime by tracing `T`'s [`serde::Deserialize`] impl —
 //!   plain `#[derive(Serialize, Deserialize)]` types work with no extra
 //!   derive; and
@@ -178,7 +178,7 @@ pub use static_schema::StaticSchema;
 /// tracing would discover, honoring the serde attributes that affect wire
 /// shape (`rename`, `rename_all`, `rename_all_fields`, `skip`,
 /// `transparent`). Lives in the same namespace trick serde uses: `Schema` is
-/// both this derive macro and the [`Schema`] type.
+/// both this derive macro and the [`struct@Schema`] type.
 #[cfg(feature = "derive")]
 pub use carbonite_derive::Schema;
 
@@ -188,7 +188,7 @@ use serde::de::DeserializeOwned;
 /// Serializes `value` into a self-describing blob (schema included).
 ///
 /// Convenience for one-shot use; it traces the schema on every call. For
-/// repeated serialization, build a [`Schema`] once and use
+/// repeated serialization, build a [`struct@Schema`] once and use
 /// [`SelfDescribingSerializer`] or [`Serializer`].
 ///
 /// `T` must implement [`DeserializeOwned`] as well as [`Serialize`] because
