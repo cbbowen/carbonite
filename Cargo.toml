@@ -2,7 +2,7 @@
 members = ["carbonite-derive"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -28,7 +28,9 @@ default = ["derive"]
 derive = ["dep:carbonite-derive"]
 
 [dependencies]
-carbonite-derive = { version = "0.1.0", path = "carbonite-derive", optional = true }
+# Pinned exactly: the derive emits calls to carbonite's `__`-prefixed internal
+# helpers, so the two must be upgraded together.
+carbonite-derive = { version = "=1.0.0", path = "carbonite-derive", optional = true }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
