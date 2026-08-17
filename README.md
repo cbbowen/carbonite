@@ -272,23 +272,33 @@ let released = Schema::<Save>::from_bytes(&snapshot).unwrap();
 compat::check(&released).unwrap();
 ```
 
-The check does not compare the two schemas. It could not: a schema records what a writer
-*wrote*, and nothing about the attributes a reader carries, so a comparison cannot tell
-whether an added field has a `#[serde(default)]`, whether a renamed one has a
-`#[serde(alias)]`, or whether a field group that became named declared the positions it
-replaced — the three most common evolutions there are. Instead it builds a blob of synthetic
-values conforming to the released schema and deserializes it as the current type, so whatever
-the real reader accepts, the check accepts.
+Two passes run, because neither settles the question alone.
 
-`compat::check_static` is the same thing with the reference schema taken from
-`#[derive(Schema)]` rather than from tracing, which is what you want for any type carrying a
-`#[serde(alias)]` — that is, any type that has been renamed or migrated.
+**Running the reader** — a blob of synthetic values conforming to the released schema,
+deserialized as the current type — decides everything whose answer is not in either schema.
+Whether an added field has a `#[serde(default)]`, whether a renamed one has a
+`#[serde(alias)]`, whether a field group that became named declared the positions it replaced:
+none of that appears in a type's structure, and two structs differing only by
+`#[serde(default)]` trace to identical field lists. Running the real reader also means the
+check never restates the reconciliation rules, so it cannot drift from them.
 
-Four things it deliberately does not cover, since a green check that means less than it looks
-is worse than none: it answers *does this decode*, not *does this still mean the same thing*;
-narrowing an integer is value-dependent and passes here; enum variants are covered
-individually rather than in every combination; and a type that validates what it deserializes
-reports `Incompatible::Inconclusive` rather than a verdict.
+**Comparing the schemas** catches what no single value can show: a field whose *range* shrank.
+A `u64` that is now a `u32` reads every number below the new ceiling and rejects the rest, so
+the two schemas are walked in parallel and their leaves compared, reporting
+`Incompatible::ValueDependent`. This pass reads nothing, so it still returns a verdict for a
+type the probe cannot touch — and it stays quiet wherever the trees stop lining up, since the
+reader's schema records neither its aliases nor its position tags and guessing there would
+mean false alarms.
+
+`compat::check_static` is the same with the reference schema taken from `#[derive(Schema)]`
+rather than from tracing, which is what you want for any type carrying a `#[serde(alias)]` —
+that is, any type that has been renamed or migrated.
+
+What neither covers, since a green check that means less than it looks is worse than none:
+they answer *does this decode*, not *does this still mean the same thing*; enum variants are
+covered individually rather than in every combination; narrowing a float loses precision
+rather than failing, so it is not reported; and a type that validates what it deserializes
+falls back to `Incompatible::Inconclusive` for anything the structural pass cannot settle.
 
 ## Types represented as another type
 

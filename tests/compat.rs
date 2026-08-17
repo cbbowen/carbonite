@@ -344,22 +344,164 @@ fn check_static_classifies_an_aliased_type() {
 // decision rather than a surprise.
 // ---------------------------------------------------------------------------
 
-/// Narrowing an integer is value-dependent: it works until a value does not
-/// fit. The probe writes values that fit every width, so it passes — the
-/// module docs say so, and this pins it.
+/// Narrowing an integer is value-dependent: it reads every number below the
+/// new ceiling and rejects the rest, so no single probe value can show it.
+/// The structural pass compares the leaves instead.
 #[test]
-fn narrowing_an_integer_is_not_covered() {
+fn narrowing_an_integer_is_caught_structurally() {
     #[derive(Serialize, Deserialize)]
     struct Wide {
         v: u64,
+        untouched: String,
     }
     #[derive(Deserialize)]
     struct Narrow {
         v: u8,
+        untouched: String,
     }
 
     let wide = Schema::<Wide>::new().unwrap();
-    compat::check::<Narrow>(&wide.cast()).unwrap();
+    let err = compat::check::<Narrow>(&wide.cast()).unwrap_err();
+    let Incompatible::ValueDependent(findings) = &err else {
+        panic!("expected ValueDependent, got {err}");
+    };
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(
+        findings[0].contains('v') && findings[0].contains("u64"),
+        "{err}"
+    );
+}
+
+#[test]
+fn widening_an_integer_is_not_a_finding() {
+    #[derive(Serialize, Deserialize)]
+    struct Small {
+        a: u8,
+        b: u32,
+        c: i8,
+    }
+    #[derive(Deserialize)]
+    struct Wider {
+        a: u64,
+        b: i64, // unsigned into a strictly wider signed type
+        c: i32,
+    }
+
+    let small = Schema::<Small>::new().unwrap();
+    compat::check::<Wider>(&small.cast()).unwrap();
+}
+
+/// Signedness is part of the range: an unsigned field needs one more bit to
+/// stay positive, and a signed one's negatives never survive.
+#[test]
+fn a_signedness_change_is_value_dependent() {
+    #[derive(Serialize, Deserialize)]
+    struct Signed {
+        v: i32,
+    }
+    #[derive(Deserialize)]
+    struct Unsigned {
+        v: u32,
+    }
+    #[derive(Serialize, Deserialize)]
+    struct SameWidthUnsigned {
+        v: u32,
+    }
+    #[derive(Deserialize)]
+    struct SameWidthSigned {
+        v: i32,
+    }
+
+    let signed = Schema::<Signed>::new().unwrap();
+    assert!(matches!(
+        compat::check::<Unsigned>(&signed.cast()).unwrap_err(),
+        Incompatible::ValueDependent(_)
+    ));
+
+    let unsigned = Schema::<SameWidthUnsigned>::new().unwrap();
+    assert!(matches!(
+        compat::check::<SameWidthSigned>(&unsigned.cast()).unwrap_err(),
+        Incompatible::ValueDependent(_)
+    ));
+}
+
+/// The structural pass needs no values, so it still returns a verdict for a
+/// type the probe cannot touch.
+#[test]
+fn a_validating_type_still_gets_a_structural_verdict() {
+    #[derive(Serialize, Deserialize, carbonite::Schema)]
+    struct WideHolder {
+        v: Even,
+        range: u64,
+    }
+    #[derive(Serialize, Deserialize, carbonite::Schema)]
+    struct NarrowHolder {
+        v: Even,
+        range: u16,
+    }
+
+    // The probe alone can say nothing about this type...
+    assert!(matches!(
+        compat::check_static::<NarrowHolder>(&NarrowHolder::schema()).unwrap_err(),
+        Incompatible::Inconclusive(_)
+    ));
+    // ...but comparing the schemas still finds the narrowing.
+    let err = compat::check_static::<NarrowHolder>(&WideHolder::schema().cast()).unwrap_err();
+    assert!(
+        matches!(err, Incompatible::ValueDependent(_)),
+        "expected ValueDependent, got {err}"
+    );
+}
+
+/// Narrowing nested inside the shapes the walk has to see through.
+#[test]
+fn narrowing_is_found_through_containers_and_variants() {
+    #[derive(Serialize, Deserialize)]
+    struct Meters(u64);
+    #[derive(Serialize, Deserialize)]
+    enum Wide {
+        A { depth: u64 },
+        B(Vec<Option<u64>>),
+        C(Meters),
+    }
+    #[derive(Deserialize)]
+    struct Centimetres(u16);
+    #[derive(Deserialize)]
+    enum Narrow {
+        A { depth: u16 },
+        B(Vec<Option<u16>>),
+        C(Centimetres),
+    }
+
+    let wide = Schema::<Wide>::new().unwrap();
+    let err = compat::check::<Narrow>(&wide.cast()).unwrap_err();
+    let Incompatible::ValueDependent(findings) = &err else {
+        panic!("expected ValueDependent, got {err}");
+    };
+    assert_eq!(findings.len(), 3, "{findings:?}");
+    assert!(
+        findings.iter().any(|f| f.contains("A.depth")),
+        "{findings:?}"
+    );
+}
+
+/// A field the other side does not name could have been renamed, dropped, or
+/// tagged; the walk stays quiet and leaves it to the probe.
+#[test]
+fn the_structural_pass_stays_quiet_where_it_cannot_be_sure() {
+    #[derive(Serialize, Deserialize)]
+    struct Before {
+        a: u64,
+    }
+    #[derive(Deserialize)]
+    struct Renamed {
+        #[serde(alias = "a")]
+        b: u16, // narrowed *and* renamed: unmatched, so not reported
+    }
+
+    let before = Schema::<Before>::new().unwrap();
+    // Readable, and the narrowing goes unremarked rather than guessed at.
+    compat::check::<Renamed>(&before.cast()).unwrap();
 }
 
 /// Round-tripping the snapshot through bytes is the actual CI flow.

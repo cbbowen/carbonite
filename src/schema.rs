@@ -69,7 +69,7 @@ impl Primitive {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Primitive::Bool => "bool",
             Primitive::I8 => "i8",

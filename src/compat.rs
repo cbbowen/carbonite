@@ -24,35 +24,48 @@
 //!
 //! # How the check works, and what that means
 //!
-//! It does not compare the two schemas. A schema records the names and shapes
-//! a writer *wrote*, and nothing about the attributes a reader carries, so a
-//! comparison could not tell whether an added field has a `#[serde(default)]`,
-//! whether a renamed one has a `#[serde(alias)]`, or whether a field group
-//! that became named declared the positions it replaced — the three most
-//! common evolutions there are. It would also be a second copy of the
-//! reconciliation rules, free to drift from the reader.
+//! Two passes, because neither settles the question alone.
 //!
-//! Instead the check *runs* the reader: it builds a blob of synthetic values
-//! conforming to the released schema and deserializes it as `T`. Whatever the
-//! real reader accepts, this accepts.
+//! **Running the reader.** A blob of synthetic values conforming to the
+//! released schema is deserialized as `T`. Whatever the real reader accepts,
+//! this accepts — including every reconciliation rule, present and future,
+//! without restating any of them.
 //!
-//! What follows from that:
+//! This pass is what decides the changes that a comparison cannot, because
+//! their answer is not in either schema. Whether an added field has a
+//! `#[serde(default)]`, whether a renamed one has a `#[serde(alias)]`, whether
+//! a field group that became named declared the positions it replaced: none of
+//! that appears in a type's structure. Two structs differing only by
+//! `#[serde(default)]` trace to identical field lists.
 //!
-//! - **It answers "does this decode", not "does this still mean the same
+//! **Comparing the schemas.** One value cannot show that a field's *range*
+//! shrank — a `u64` that is now a `u32` reads every number below the new
+//! ceiling and rejects the rest — so the two schemas are also walked in
+//! parallel and their leaves compared. Findings are reported as
+//! [`Incompatible::ValueDependent`].
+//!
+//! This pass reports only what it can be sure of. Where the trees stop lining
+//! up — a field or variant the other side does not name, a shape that changed
+//! — it says nothing, because the reader's schema records neither its aliases
+//! nor its position tags, and guessing would mean false alarms. It also runs
+//! without reading anything, so it still returns a verdict for a type the
+//! probe cannot touch.
+//!
+//! What neither covers:
+//!
+//! - **They answer "does this decode", not "does this still mean the same
 //!   thing".** A field that changes units reads perfectly and is still a
 //!   silent break. No schema tool catches that.
-//! - **Value-dependent changes are out of reach.** The probe writes values
-//!   that fit every integer width, so narrowing a field (`u64` to `u32`)
-//!   passes here and can still reject real data. Treat narrowing as a change
-//!   this check does not cover.
 //! - **Enum variants are covered individually, not in combination.** Every
 //!   variant of every enum is exercised at least once; two enums are not
 //!   tried in every pairing, which would be exponential.
 //! - **A type that validates its input cannot be probed.** Synthetic values
 //!   mean nothing to a `#[serde(try_from)]` guarding a real invariant, and it
-//!   is right to reject them. That is reported as
-//!   [`Incompatible::Inconclusive`] rather than as a break — see there for how
-//!   it is told apart from a genuine one.
+//!   is right to reject them. The structural pass still speaks; anything left
+//!   over is [`Incompatible::Inconclusive`] rather than a break.
+//! - **Narrowing a float is not reported.** serde's `f32` accepts a
+//!   `visit_f64`, so it loses precision rather than failing, and that is a
+//!   change of meaning rather than of readability.
 //! - **[`Shared`](crate::Shared) values are written as first occurrences.**
 //!   Repeats are not exercised.
 
@@ -73,6 +86,11 @@ pub enum Incompatible {
     /// The type could not read a value written with the released schema.
     /// This is a real break: data in that format is no longer decodable.
     Unreadable(Error),
+    /// The type reads *some* values written with the released schema and
+    /// rejects others — a field whose range shrank, such as a `u64` that is
+    /// now a `u32`. Found by comparing the two schemas rather than by reading
+    /// anything, since no single value can demonstrate it.
+    ValueDependent(Vec<String>),
     /// The probe proves nothing either way, so the result must not be read as
     /// a break — or as an all-clear.
     ///
@@ -96,6 +114,13 @@ impl fmt::Display for Incompatible {
             Incompatible::Unreadable(e) => {
                 write!(f, "the current type cannot read this schema's data: {e}")
             }
+            Incompatible::ValueDependent(findings) => {
+                write!(
+                    f,
+                    "the current type reads only some of this schema's data: {}",
+                    findings.join("; ")
+                )
+            }
             Incompatible::Inconclusive(e) => write!(
                 f,
                 "compatibility with this schema could not be determined, because the current \
@@ -110,6 +135,7 @@ impl std::error::Error for Incompatible {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Incompatible::Unreadable(e) | Incompatible::Inconclusive(e) => Some(e),
+            Incompatible::ValueDependent(_) => None,
         }
     }
 }
@@ -146,24 +172,191 @@ pub fn check_static<T: DeserializeOwned + StaticSchema>(
     verify(released, || Some(T::schema_node()))
 }
 
-/// Probes `released`, and on failure probes `T`'s own schema to work out
-/// whether the type refuses the values or the shape.
+/// Runs both passes: a structural comparison for what values cannot settle,
+/// and the probe for what structure cannot.
 fn verify<T: DeserializeOwned>(
     released: &Schema<T>,
     reference: impl Fn() -> Option<SchemaNode>,
 ) -> Result<(), Incompatible> {
+    let own = reference();
+    // Structural first: it needs no values, so it still returns a verdict for
+    // a type the probe cannot touch.
+    let narrowed = own
+        .as_ref()
+        .map(|own| narrowings(released.node(), own))
+        .unwrap_or_default();
+
     let Err(error) = probe::<T>(released.node()) else {
-        return Ok(());
+        return if narrowed.is_empty() {
+            Ok(())
+        } else {
+            Err(Incompatible::ValueDependent(narrowed))
+        };
     };
     // A type that cannot read a probe of its *own* schema is rejecting the
     // synthetic values rather than this particular shape, and one whose own
-    // schema is unavailable cannot be placed either way. Both are reported as
-    // inconclusive: only a type that demonstrably reads its own schema and
-    // still fails this one has really broken.
-    match reference() {
+    // schema is unavailable cannot be placed either way. Neither is a break —
+    // only a type that demonstrably reads its own schema and still fails this
+    // one has really broken.
+    match own {
         Some(own) if probe::<T>(&own).is_ok() => Err(Incompatible::Unreadable(error)),
+        _ if !narrowed.is_empty() => Err(Incompatible::ValueDependent(narrowed)),
         _ => Err(Incompatible::Inconclusive(error)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The structural pass.
+//
+// Values cannot settle whether a field's range still holds: a probe writes one
+// number, and a narrowing rejects only the numbers above the new ceiling. So
+// the two schemas are walked in parallel and their leaves compared.
+//
+// It reports only what it can be *sure* of. Where the trees stop lining up —
+// a field or variant the other side does not name, a shape that changed — it
+// says nothing and leaves the question to the probe, because the reader's
+// schema records neither its `#[serde(alias)]`es nor its position tags, and
+// guessing there would mean false alarms.
+// ---------------------------------------------------------------------------
+
+/// Every leaf where the released schema holds values the current type cannot.
+fn narrowings(writer: &SchemaNode, reader: &SchemaNode) -> Vec<String> {
+    let mut out = Vec::new();
+    walk(writer, reader, &mut String::new(), &mut out);
+    out
+}
+
+fn walk(writer: &SchemaNode, reader: &SchemaNode, path: &mut String, out: &mut Vec<String>) {
+    match (writer, reader) {
+        (SchemaNode::Primitive(w), SchemaNode::Primitive(r)) => {
+            if !fits(*w, *r) {
+                let at = if path.is_empty() {
+                    "the value".to_owned()
+                } else {
+                    format!("`{path}`")
+                };
+                out.push(format!(
+                    "{at} was written as {} and is now {}, which cannot hold every value the \
+                     older one could",
+                    w.name(),
+                    r.name()
+                ));
+            }
+        }
+        // A newtype wrapper is invisible on the wire, so see through it on
+        // either side; the same goes for a field that has gained an `Option`.
+        (
+            SchemaNode::NewtypeStruct { inner: w, .. },
+            SchemaNode::NewtypeStruct { inner: r, .. },
+        ) => walk(w, r, path, out),
+        (SchemaNode::NewtypeStruct { inner: w, .. }, r) => walk(w, r, path, out),
+        (w, SchemaNode::NewtypeStruct { inner: r, .. }) => walk(w, r, path, out),
+        (SchemaNode::Option(w), SchemaNode::Option(r))
+        | (SchemaNode::Seq(w), SchemaNode::Seq(r))
+        | (SchemaNode::Shared(w), SchemaNode::Shared(r)) => walk(w, r, path, out),
+        (w, SchemaNode::Option(r)) => walk(w, r, path, out),
+        (SchemaNode::Map { key: wk, value: wv }, SchemaNode::Map { key: rk, value: rv }) => {
+            scoped(path, "key", |p| walk(wk, rk, p, out));
+            scoped(path, "value", |p| walk(wv, rv, p, out));
+        }
+        (
+            SchemaNode::Tuple(wf) | SchemaNode::TupleStruct { fields: wf, .. },
+            SchemaNode::Tuple(rf) | SchemaNode::TupleStruct { fields: rf, .. },
+        ) => {
+            for (index, (w, r)) in wf.iter().zip(rf).enumerate() {
+                scoped(path, &index.to_string(), |p| walk(w, r, p, out));
+            }
+        }
+        (SchemaNode::Struct { fields: wf, .. }, SchemaNode::Struct { fields: rf, .. }) => {
+            for (name, w) in wf {
+                // A field the reader does not name may have been renamed or
+                // dropped; either way there is nothing to compare.
+                if let Some((_, r)) = rf.iter().find(|(rname, _)| rname == name) {
+                    scoped(path, name, |p| walk(w, r, p, out));
+                }
+            }
+        }
+        (SchemaNode::Enum { variants: wv, .. }, SchemaNode::Enum { variants: rv, .. }) => {
+            for (name, w) in wv {
+                if let Some((_, r)) = rv.iter().find(|(rname, _)| rname == name) {
+                    scoped(path, name, |p| walk_variant(w, r, p, out));
+                }
+            }
+        }
+        // Anything else has changed shape, which the probe decides.
+        _ => {}
+    }
+}
+
+fn walk_variant(
+    writer: &VariantNode,
+    reader: &VariantNode,
+    path: &mut String,
+    out: &mut Vec<String>,
+) {
+    match (writer, reader) {
+        (VariantNode::Newtype(w), VariantNode::Newtype(r)) => walk(w, r, path, out),
+        (VariantNode::Tuple(wf), VariantNode::Tuple(rf)) => {
+            for (index, (w, r)) in wf.iter().zip(rf).enumerate() {
+                scoped(path, &index.to_string(), |p| walk(w, r, p, out));
+            }
+        }
+        (VariantNode::Struct(wf), VariantNode::Struct(rf)) => {
+            for (name, w) in wf {
+                if let Some((_, r)) = rf.iter().find(|(rname, _)| rname == name) {
+                    scoped(path, name, |p| walk(w, r, p, out));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scoped(path: &mut String, segment: &str, f: impl FnOnce(&mut String)) {
+    let restore = path.len();
+    if !path.is_empty() {
+        path.push('.');
+    }
+    path.push_str(segment);
+    f(path);
+    path.truncate(restore);
+}
+
+/// Whether every value the writer's primitive can hold survives being read as
+/// the reader's.
+///
+/// Floats are left alone: serde's `f32` accepts a `visit_f64`, so narrowing one
+/// loses precision rather than failing, and this check speaks to what decodes.
+fn fits(writer: Primitive, reader: Primitive) -> bool {
+    match (integer(writer), integer(reader)) {
+        (Some((w_signed, w_bits)), Some((r_signed, r_bits))) => match (w_signed, r_signed) {
+            (false, false) | (true, true) => w_bits <= r_bits,
+            // An unsigned value needs one more bit to stay positive when read
+            // as a signed one; a signed value's negatives never survive.
+            (false, true) => w_bits < r_bits,
+            (true, false) => false,
+        },
+        // Anything that is not a pair of integers either matches exactly or is
+        // a change of kind, which the probe reports.
+        _ => true,
+    }
+}
+
+/// `(signed, bits)` for the integer primitives.
+fn integer(p: Primitive) -> Option<(bool, u32)> {
+    Some(match p {
+        Primitive::U8 => (false, 8),
+        Primitive::U16 => (false, 16),
+        Primitive::U32 => (false, 32),
+        Primitive::U64 => (false, 64),
+        Primitive::U128 => (false, 128),
+        Primitive::I8 => (true, 8),
+        Primitive::I16 => (true, 16),
+        Primitive::I32 => (true, 32),
+        Primitive::I64 => (true, 64),
+        Primitive::I128 => (true, 128),
+        _ => return None,
+    })
 }
 
 /// Builds a blob conforming to `writer` and reads every row of it as `T`.
