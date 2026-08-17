@@ -4,8 +4,8 @@
 use std::fmt::Debug;
 
 use carbonite::{
-    Batch, ColumnCursor, Deserializer, Error, Rows, RowsColumns, Schema, SelfDescribingDeserializer,
-    SelfDescribingSerializer, Serializer, StaticSchema,
+    Batch, ColumnCursor, Deserializer, Error, Rows, RowsColumns, Schema,
+    SelfDescribingDeserializer, SelfDescribingSerializer, Serializer, StaticSchema,
 };
 use serde::{Deserialize, Serialize};
 
@@ -136,14 +136,17 @@ fn self_describing_columnar_writer_matches_the_serde_writer() {
         sensor: 3,
         celsius: 1.5,
     };
-    assert_eq!(ser.to_vec_columns(&value).unwrap(), ser.to_vec(&value).unwrap());
+    assert_eq!(
+        ser.to_vec_columns(&value).unwrap(),
+        ser.to_vec(&value).unwrap()
+    );
     assert_eq!(
         carbonite::to_vec_static(&value).unwrap(),
         carbonite::to_vec(&value).unwrap()
     );
 
-    let back: Reading = carbonite::from_slice_static(&carbonite::to_vec_static(&value).unwrap())
-        .unwrap();
+    let back: Reading =
+        carbonite::from_slice_static(&carbonite::to_vec_static(&value).unwrap()).unwrap();
     assert_eq!(back, value);
 }
 
@@ -190,7 +193,10 @@ fn reset_discards_pushed_rows() {
 fn schema_bytes_lead_with_the_schema_version() {
     let bytes = Reading::schema().to_bytes();
     assert_eq!(bytes[0] as u64, carbonite::SCHEMA_VERSION);
-    assert_eq!(Schema::<Reading>::from_bytes(&bytes).unwrap(), Reading::schema());
+    assert_eq!(
+        Schema::<Reading>::from_bytes(&bytes).unwrap(),
+        Reading::schema()
+    );
 }
 
 #[test]
@@ -299,13 +305,19 @@ fn a_renamed_carbonite_dependency_still_derives() {
 
     let pixel = Pixel { x: 4, luma: 0.5 };
     let bytes = carbonite::to_vec_static(&pixel).unwrap();
-    assert_eq!(carbonite::from_slice_static::<Pixel>(&bytes).unwrap(), pixel);
+    assert_eq!(
+        carbonite::from_slice_static::<Pixel>(&bytes).unwrap(),
+        pixel
+    );
     assert_eq!(Pixel::schema(), Schema::<Pixel>::new().unwrap());
 
     let shade = Shade::Named {
         label: "dusk".to_owned(),
     };
     let bytes = carbonite::to_vec_static(&shade).unwrap();
-    assert_eq!(carbonite::from_slice_static::<Shade>(&bytes).unwrap(), shade);
+    assert_eq!(
+        carbonite::from_slice_static::<Shade>(&bytes).unwrap(),
+        shade
+    );
     assert_eq!(Shade::schema(), Schema::<Shade>::new().unwrap());
 }

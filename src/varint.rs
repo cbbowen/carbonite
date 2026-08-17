@@ -96,13 +96,19 @@ mod tests {
     fn rejects_non_canonical_encodings() {
         // Zero padded out to two, three, and ten bytes.
         assert!(matches!(read(&[0x80, 0x00]), Err(Error::InvalidVarint)));
-        assert!(matches!(read(&[0x80, 0x80, 0x00]), Err(Error::InvalidVarint)));
+        assert!(matches!(
+            read(&[0x80, 0x80, 0x00]),
+            Err(Error::InvalidVarint)
+        ));
         let mut buf = vec![0x80u8; 9];
         buf.push(0x00);
         assert!(matches!(read(&buf), Err(Error::InvalidVarint)));
         // A padded small value, and a padded multi-byte value.
         assert!(matches!(read(&[0x85, 0x00]), Err(Error::InvalidVarint)));
-        assert!(matches!(read(&[0xff, 0xff, 0x00]), Err(Error::InvalidVarint)));
+        assert!(matches!(
+            read(&[0xff, 0xff, 0x00]),
+            Err(Error::InvalidVarint)
+        ));
         // The canonical forms of the same values still read.
         assert_eq!(read(&[0x00]).unwrap(), (0, 1));
         assert_eq!(read(&[0x05]).unwrap(), (5, 1));

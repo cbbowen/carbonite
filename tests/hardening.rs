@@ -250,7 +250,11 @@ fn decoding_and_re_encoding_reproduces_the_bytes() {
     let original = batch.finish();
 
     let de = Deserializer::new_static(Reading::schema());
-    let rows: Vec<Reading> = de.rows(&original).unwrap().collect::<Result<_, _>>().unwrap();
+    let rows: Vec<Reading> = de
+        .rows(&original)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
 
     let mut again = ser.batch();
     for row in &rows {

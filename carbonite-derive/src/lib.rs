@@ -118,9 +118,8 @@ fn parse_crate_path(attrs: &[syn::Attribute]) -> syn::Result<Path> {
                 path = meta.value()?.parse::<LitStr>()?.parse()?;
                 Ok(())
             } else {
-                Err(meta.error(
-                    "unrecognized carbonite attribute; the only one is `crate = \"...\"`",
-                ))
+                Err(meta
+                    .error("unrecognized carbonite attribute; the only one is `crate = \"...\"`"))
             }
         })?;
     }
@@ -312,7 +311,9 @@ impl ParamRoles {
     fn apply(&self, generics: &mut syn::Generics, primary: &Path, krate: &Path) {
         for param in generics.type_params_mut() {
             if self.fallback.contains(&param.ident) {
-                param.bounds.push(parse_quote!(#krate::fallback::SerdeField));
+                param
+                    .bounds
+                    .push(parse_quote!(#krate::fallback::SerdeField));
             }
             if !self.fallback_only.contains(&param.ident) {
                 param.bounds.push(parse_quote!(#primary));

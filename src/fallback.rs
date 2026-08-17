@@ -36,7 +36,7 @@ use std::sync::{OnceLock, PoisonError, RwLock};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::columnar::{ColumnCursor, __split};
+use crate::columnar::{__split, ColumnCursor};
 use crate::error::Result;
 use crate::layout::Layout;
 use crate::schema::SchemaNode;

@@ -793,8 +793,12 @@ impl<'de, T: DeserializeColumns<'de>, E: DeserializeColumns<'de>> DeserializeCol
 {
     fn deserialize_columns(cursors: &mut [ColumnCursor<'de>]) -> Result<Self> {
         match cursors[0].varint()? {
-            0 => Ok(Ok(T::deserialize_columns(&mut cursors[1..1 + T::columns()])?)),
-            1 => Ok(Err(E::deserialize_columns(&mut cursors[1 + T::columns()..])?)),
+            0 => Ok(Ok(T::deserialize_columns(
+                &mut cursors[1..1 + T::columns()],
+            )?)),
+            1 => Ok(Err(E::deserialize_columns(
+                &mut cursors[1 + T::columns()..],
+            )?)),
             tag => Err(__invalid_variant(tag)),
         }
     }

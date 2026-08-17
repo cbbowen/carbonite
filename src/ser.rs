@@ -279,10 +279,7 @@ impl<T: ?Sized> fmt::Debug for Batch<'_, T> {
         f.debug_struct("Batch")
             .field("rows", &self.rows)
             .field("columns", &self.columns.len())
-            .field(
-                "bytes",
-                &self.columns.iter().map(Vec::len).sum::<usize>(),
-            )
+            .field("bytes", &self.columns.iter().map(Vec::len).sum::<usize>())
             .finish()
     }
 }
@@ -585,7 +582,12 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
 
     fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq> {
         match (self.node, self.lnode) {
-            (SchemaNode::Seq(elem), LNode::Seq { len, elem: lelem, .. }) => Ok(SeqSerializer {
+            (
+                SchemaNode::Seq(elem),
+                LNode::Seq {
+                    len, elem: lelem, ..
+                },
+            ) => Ok(SeqSerializer {
                 elem,
                 lelem,
                 len_col: *len,

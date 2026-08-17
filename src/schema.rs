@@ -606,7 +606,10 @@ impl<T: ?Sized> Schema<T> {
 impl<T: ?Sized> Serialize for Schema<T> {
     /// Serializes the versioned byte form, so a schema routed through another
     /// serde format carries the same version marker as [`Schema::to_bytes`].
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         serializer.serialize_bytes(&self.to_bytes())
     }
 }
@@ -824,6 +827,9 @@ mod tests {
 
     #[test]
     fn display_describes_the_shape() {
-        assert_eq!(Schema::<()>::from_node(sample()).to_string(), "struct `Save`");
+        assert_eq!(
+            Schema::<()>::from_node(sample()).to_string(),
+            "struct `Save`"
+        );
     }
 }

@@ -539,8 +539,14 @@ fn shared_dedup_survives_the_boundary() {
     for bytes in [&serde_bytes, &columnar_bytes] {
         let back: Scene = de.from_slice(bytes).unwrap();
         assert_eq!(back, scene);
-        assert!(Shared::ptr_eq(&back.assets.meshes[0], &back.assets.meshes[1]));
-        assert!(Shared::ptr_eq(&back.assets.meshes[1], &back.assets.meshes[2]));
+        assert!(Shared::ptr_eq(
+            &back.assets.meshes[0],
+            &back.assets.meshes[1]
+        ));
+        assert!(Shared::ptr_eq(
+            &back.assets.meshes[1],
+            &back.assets.meshes[2]
+        ));
 
         let columnar: Scene = de.from_slice_columns(bytes).unwrap();
         assert!(Shared::ptr_eq(
