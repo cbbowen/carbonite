@@ -1,0 +1,29 @@
+[workspace]
+members = ["carbonite-derive"]
+
+[package]
+name = "carbonite"
+version = "0.1.0"
+edition = "2024"
+description = "Schema-separated columnar serialization built on serde"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["derive"]
+# Re-exports `#[derive(Schema)]`, the compile-time schema fast path.
+derive = ["dep:carbonite-derive"]
+
+[dependencies]
+carbonite-derive = { version = "0.1.0", path = "carbonite-derive", optional = true }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+criterion = "0.8"
+flate2 = "1"
+postcard = { version = "1", features = ["alloc"] }
+proptest = "1"
+
+[[bench]]
+name = "compare"
+harness = false
