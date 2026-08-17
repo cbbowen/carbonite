@@ -248,6 +248,48 @@ so `Schema::<T>::new()` cannot recover it and says so. Since renaming and every
 positional-to-named change need an alias, a migrated type is derive-only for writing: put
 `#[derive(carbonite::Schema)]` on it and use `T::schema()`. Reading is unaffected.
 
+## Checking compatibility in CI
+
+Snapshot the schema at each release, keep the bytes in the repository, and assert that
+today's type still reads all of them:
+
+```rust
+use serde::{Serialize, Deserialize};
+use carbonite::{Schema, compat};
+
+#[derive(Serialize, Deserialize, carbonite::Schema)]
+struct Save {
+    id: u32,
+    #[serde(default)]
+    mana: u32,
+}
+
+// At release time: std::fs::write("schemas/save-v2.bin", Schema::<Save>::new()?.to_bytes())?;
+# let snapshot = { #[derive(Serialize, Deserialize)] struct SaveV1 { id: u32 } Schema::<SaveV1>::new().unwrap().to_bytes() };
+
+// In CI:
+let released = Schema::<Save>::from_bytes(&snapshot).unwrap();
+compat::check(&released).unwrap();
+```
+
+The check does not compare the two schemas. It could not: a schema records what a writer
+*wrote*, and nothing about the attributes a reader carries, so a comparison cannot tell
+whether an added field has a `#[serde(default)]`, whether a renamed one has a
+`#[serde(alias)]`, or whether a field group that became named declared the positions it
+replaced — the three most common evolutions there are. Instead it builds a blob of synthetic
+values conforming to the released schema and deserializes it as the current type, so whatever
+the real reader accepts, the check accepts.
+
+`compat::check_static` is the same thing with the reference schema taken from
+`#[derive(Schema)]` rather than from tracing, which is what you want for any type carrying a
+`#[serde(alias)]` — that is, any type that has been renamed or migrated.
+
+Four things it deliberately does not cover, since a green check that means less than it looks
+is worse than none: it answers *does this decode*, not *does this still mean the same thing*;
+narrowing an integer is value-dependent and passes here; enum variants are covered
+individually rather than in every combination; and a type that validates what it deserializes
+reports `Incompatible::Inconclusive` rather than a verdict.
+
 ## Types represented as another type
 
 `#[serde(from)]` / `#[serde(into)]` (and `try_from`) let a type keep invariants its wire form

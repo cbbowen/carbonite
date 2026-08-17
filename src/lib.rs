@@ -365,6 +365,7 @@ assert_eq!(carbonite::from_slice_static::<Transform>(&bytes)?, transform);
 struct ReadmeDoctests;
 
 pub mod columnar;
+pub mod compat;
 mod de;
 mod error;
 #[doc(hidden)]
