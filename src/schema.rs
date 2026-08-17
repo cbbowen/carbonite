@@ -20,6 +20,11 @@ pub(crate) const MAX_DEPTH: usize = 256;
 /// one, so a `Schema` written by an older release stays readable. A schema
 /// declaring a *newer* version is rejected with
 /// [`Error::UnsupportedVersion`] rather than misinterpreted.
+///
+/// Data blobs carry no version of their own: a blob is only readable with its
+/// schema in hand, so its encoding is versioned by the schema that accompanies
+/// it. This constant therefore covers the **blob** encoding too — any change
+/// to how data (not just schemas) reaches the wire bumps it.
 pub const SCHEMA_VERSION: u64 = 1;
 
 /// A fixed-width primitive in the serde data model.

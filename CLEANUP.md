@@ -152,8 +152,6 @@ scope would close the hazard outright, but the `Serialize` impl lacks a
 
 ## 7. Compatibility contract
 
-- [ ] **Data blobs carry no version of their own**; their encoding is
-  implicitly versioned by the accompanying schema. That works only if
-  `SCHEMA_VERSION` is bumped for any change to the *blob* encoding too, not
-  just the schema encoding. State that promise explicitly in the
-  `SCHEMA_VERSION` docs.
+- [x] **Data blobs carry no version of their own**; the `SCHEMA_VERSION` docs
+  now state explicitly that the constant covers the blob encoding too — any
+  change to how data reaches the wire bumps it.
