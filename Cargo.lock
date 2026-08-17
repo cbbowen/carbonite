@@ -93,6 +93,7 @@ dependencies = [
  "carbonite-derive",
  "criterion",
  "flate2",
+ "glam",
  "postcard",
  "proptest",
  "serde",
@@ -374,6 +375,15 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
+]
+
+[[package]]
+name = "glam"
+version = "0.33.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360bd2cd76e0cd9032d42cf2922155cecea2685b0cfa4630c3246df030bcfd6"
+dependencies = [
+ "serde_core",
 ]
 
 [[package]]

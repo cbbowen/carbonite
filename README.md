@@ -26,7 +26,8 @@ self-describing format with the size and speed of a binary one:
 - **Identity-aware**: `Shared<T>`/`SharedArc<T>` write each unique `Rc`/`Arc` object once
   and rebuild real pointer sharing on read.
 - **Ecosystem-friendly**: `#[carbonite(serde)]` lets a derived type hold fields whose types
-  come from crates that only ship serde impls, with no change to the encoding.
+  come from crates that only ship serde impls, with no change to the encoding — and the
+  `glam` feature puts glam's math types on the fast path outright.
 - **Safe on untrusted input**: every count a blob claims is validated against the bytes it
   actually carries, so decoding work stays proportional to the input.
 
@@ -190,6 +191,33 @@ the whole type had been traced, so the schema still describes it in full, evolut
 works across it, and a reader needs no idea the attribute was used. Only that field pays serde
 dispatch — the rest of the type keeps the monomorphized path. The field type must be
 `DeserializeOwned + 'static` and traceable.
+
+### `glam`, on the fast path
+
+Math types are the ones a columnar format most wants monomorphized — a `Vec<Vec3>` becomes
+three contiguous `f32` runs — which the tracing fallback above cannot give them. The `glam`
+feature implements carbonite's traits for glam's types directly, where the orphan rule allows
+it:
+
+```toml
+carbonite = { version = "1", features = ["glam"] }
+```
+
+```rust,ignore
+#[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug)]
+struct Transform {
+    translation: Vec3,          // no #[carbonite(serde)] needed
+    rotation: Quat,
+    scale: Vec3,
+}
+```
+
+Vectors (`Vec2`/`Vec3`/`Vec3A`/`Vec4` and their `D`/`I`/`U`/`B` siblings, sized-integer
+families included), quaternions, matrices, affine transforms, and `EulerRot` are covered, each
+laid out exactly as glam's own serde impls describe it — so the schema equals a traced one, and
+the bytes are what a peer holding a plain `(f32, f32, f32)` reads. `BVec3A` and `BVec4A` are
+excluded: glam's hand-written impls for those two contradict each other, so no schema can serve
+both directions.
 
 ## Shared values, written once
 

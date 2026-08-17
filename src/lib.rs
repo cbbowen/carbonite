@@ -241,6 +241,51 @@
 //! built, since traceability is a property of the type rather than of any
 //! value.
 //!
+//! ## `glam`
+//!
+//! Math types are the ones a columnar format most wants on the fast path — a
+//! `Vec<Vec3>` becomes three contiguous `f32` runs — and the tracing fallback
+//! above cannot give them that. So the **`glam` feature** implements
+//! [`StaticSchema`], [`SerializeColumns`] and [`DeserializeColumns`] for
+//! `glam`'s types directly, where the orphan rule allows it:
+//!
+#![cfg_attr(
+    feature = "glam",
+    doc = r#"```
+use glam::{Quat, Vec3};
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug)]
+struct Transform {
+    translation: Vec3,          // no `#[carbonite(serde)]` needed
+    rotation: Quat,
+    scale: Vec3,
+}
+
+let transform = Transform {
+    translation: Vec3::new(1.0, 2.0, 3.0),
+    rotation: Quat::IDENTITY,
+    scale: Vec3::splat(2.0),
+};
+let bytes = carbonite::to_vec_static(&transform)?;
+assert_eq!(carbonite::from_slice_static::<Transform>(&bytes)?, transform);
+# Ok::<(), carbonite::Error>(())
+```"#
+)]
+//!
+//! Covered: vectors (`Vec2`/`Vec3`/`Vec3A`/`Vec4` and their `D`/`I`/`U`/`B`
+//! siblings, including the sized-integer families), quaternions, matrices,
+//! affine transforms, and `EulerRot`. Each reaches the wire exactly as glam's
+//! own serde impls describe it — a tuple struct of components, column-major for
+//! matrices — so the schema equals a traced one and the bytes are what a peer
+//! holding a plain `(f32, f32, f32)` would read.
+//!
+//! The feature enables glam's `serde` and `all-types` features (`all-types` is
+//! glam's own default), since which types exist has to be settled at compile
+//! time. `BVec3A` and `BVec4A` are the two exclusions: glam's hand-written
+//! impls for them contradict each other, so no schema can serve both
+//! directions — use `BVec3`/`BVec4` until that is fixed upstream.
+//!
 //! # Shared values
 //!
 //! serde's tree-shaped data model serializes an `Rc`/`Arc` pointee once per
@@ -324,6 +369,8 @@ mod de;
 mod error;
 #[doc(hidden)]
 pub mod fallback;
+#[cfg(feature = "glam")]
+mod glam;
 mod layout;
 mod schema;
 mod self_describing;

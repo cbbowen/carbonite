@@ -26,6 +26,10 @@ authors.workspace = true
 default = ["derive"]
 # Re-exports `#[derive(Schema)]`, the compile-time schema fast path.
 derive = ["dep:carbonite-derive"]
+# Compile-time schemas and columnar fast paths for `glam`'s math types, which
+# the orphan rule puts out of reach for glam's own users. Turns on glam's
+# `serde` and `all-types` features so every implemented type is present.
+glam = ["dep:glam"]
 
 [dependencies]
 # Pinned exactly: the derive emits calls to carbonite's internal helpers (the
@@ -34,6 +38,15 @@ derive = ["dep:carbonite-derive"]
 carbonite-derive = { version = "=1.0.0", path = "carbonite-derive", optional = true }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+
+# The implemented set is fixed at compile time, so the type families glam gates
+# behind features have to be present: `all-types` is glam's own default, and
+# `serde` is what the schemas here mirror.
+glam = { version = "0.33", optional = true, default-features = false, features = [
+    "std",
+    "all-types",
+    "serde",
+] }
 
 [dev-dependencies]
 criterion = "0.8"
