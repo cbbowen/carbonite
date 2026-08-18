@@ -7,7 +7,7 @@ use quote::quote;
 use syn::{DeriveInput, Fields, Path};
 
 use crate::attrs::{ContainerAttrs, parse_field_attrs, parse_variant_attrs};
-use crate::model::{field_node, strip_raw};
+use crate::model::{field_node, field_wire_name, variant_wire_name};
 use crate::rename::RenameRule;
 
 pub(crate) fn expand_struct(
@@ -98,13 +98,7 @@ pub(crate) fn expand_enum(
         if attrs.skip {
             continue;
         }
-        let variant_name = attrs.rename.clone().unwrap_or_else(|| {
-            let ident = strip_raw(&variant.ident.to_string());
-            match container.rename_all {
-                Some(rule) => rule.apply_to_variant(&ident),
-                None => ident,
-            }
-        });
+        let variant_name = variant_wire_name(&variant.ident, &attrs, container.rename_all);
         // Field-name casing inside a struct variant: variant-level
         // rename_all wins over container-level rename_all_fields.
         let field_rule = attrs.rename_all.or(container.rename_all_fields);
@@ -153,11 +147,7 @@ fn named_field_entries(
         if attrs.skip {
             continue;
         }
-        let ident = strip_raw(&field.ident.as_ref().expect("named field").to_string());
-        let name = attrs.rename.clone().unwrap_or_else(|| match rule {
-            Some(rule) => rule.apply_to_field(&ident),
-            None => ident,
-        });
+        let name = field_wire_name(field.ident.as_ref().expect("named field"), &attrs, rule);
         let node = field_node(&field.ty, attrs.fallback, krate);
         entries.push(quote! {
             (#name.to_owned(), #node)

@@ -1,0 +1,5 @@
+error: `as` replaces the field-based derivation, so this type's own fields never reach the wire and it has no slots of its own to retire; the retirement belongs on the wire type
+ --> tests/ui/removed_with_as.rs:5:33
+  |
+5 | #[carbonite(as = "u32", removed("hp"))]
+  |                                 ^^^^

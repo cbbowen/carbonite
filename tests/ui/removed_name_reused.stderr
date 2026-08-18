@@ -1,0 +1,6 @@
+error: the name `hp` is retired: data written while the old field held it still carries that column, and a field of the same name reads it — rename this field, or make it `()` if it is only here to hold the name down
+ --> tests/ui/removed_name_reused.rs:7:5
+  |
+7 | /     #[serde(default)]
+8 | |     hp: f32,
+  | |___________^

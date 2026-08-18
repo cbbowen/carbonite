@@ -125,7 +125,7 @@ Every row below is a test in `tests/evolution.rs` or `tests/shape_evolution.rs`.
 | Change | | Needs |
 | --- | --- | --- |
 | Add a field | ✓ | `#[serde(default)]` |
-| Remove a field | ✓ | — |
+| Remove a field | ✓ | `#[carbonite(removed("name"))]`, so nothing takes the name back |
 | Reorder fields | ✓ | — |
 | Rename a field | ✓ | `#[serde(alias = "old")]` |
 | Widen an integer (`u32` → `u64`) | ✓ | — |
@@ -241,6 +241,50 @@ written. The widening is one-way. Going back would succeed for the rows holding 
 element and fail for the others, and a change that decodes row by row is not one you can ship,
 so it is refused outright. `[T; N]` is a tuple in this format rather than a sequence, so it is
 not a target for the widening.
+
+**Removal is a one-way door**
+
+Each rule above is safe on its own. Composing *remove* with *add* is not, and this is the one
+place where following the table still gets you into trouble:
+
+```text
+Foo(f32, u32)  ->  Foo(f32)  ->  Foo(f32, f32)
+```
+
+Every step is allowed, but the last type reads the first type's dead `u32` column into its new
+field — serde coerces the integer, so it arrives as a plausible number rather than an error.
+The same happens by name: remove `hp`, add `hp` back later, and old rows still carry an `hp`
+column for it to find. Nothing downstream can catch this. Where the old and new types agree on
+the type of the slot, the two schemas are *byte-identical*, so there is nothing for a schema
+comparison — `compat::check` included — to compare.
+
+So a removal is recorded on the type, and `#[derive(Schema)]` enforces it:
+
+```rust
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, carbonite::Schema)]
+#[carbonite(removed("hp"))]
+struct Save {
+    id: u32,
+    // A field named `hp`, or one carrying `#[serde(alias = "hp")]`, is now a
+    // compile error here.
+    #[serde(default)]
+    health: f32,
+}
+
+#[derive(Serialize, Deserialize, carbonite::Schema)]
+#[carbonite(removed(1))]
+struct Point(f32, (), #[serde(default)] f32);
+```
+
+Retirements are compile-time only — they never reach the schema or the data. A name may be
+retired outright, since an unclaimed name is simply skipped when old data carries it. A
+*position* has to be held, because positions are matched in order: put `()` where the old field
+was, which occupies no data columns, and let new fields follow it. Enum variants are matched by
+name, so a retired variant name can never come back at all.
+
+The one thing to remember is the retirement itself, at the moment you remove the field.
 
 **Three things worth knowing**
 

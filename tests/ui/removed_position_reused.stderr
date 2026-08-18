@@ -1,0 +1,5 @@
+error: position 1 is retired: data written while the old field held it still carries that column, and positions are matched in order, so this field reads it — put `()` at position 1 and move this field after it
+ --> tests/ui/removed_position_reused.rs:5:19
+  |
+5 | struct Point(f32, f32);
+  |                   ^^^

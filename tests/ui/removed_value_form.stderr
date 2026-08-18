@@ -1,0 +1,5 @@
+error: write the retired slots as a list: `removed("old_name")`, `removed(1)`
+ --> tests/ui/removed_value_form.rs:4:13
+  |
+4 | #[carbonite(removed = "hp")]
+  |             ^^^^^^^

@@ -1,0 +1,5 @@
+error: a retirement names a slot that no longer has a field of its own, so it goes on the container or the variant rather than on a field: `#[carbonite(removed("old_name"))]`
+ --> tests/ui/removed_placement.rs:6:17
+  |
+6 |     #[carbonite(removed)]
+  |                 ^^^^^^^

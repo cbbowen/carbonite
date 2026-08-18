@@ -1,0 +1,5 @@
+error: the variant name `Bow` is retired: the tag in data written while the old variant held it resolves to this name, so those rows decode as this variant — a variant name cannot be reused, and unlike a field it has no `()` form to retire it with
+ --> tests/ui/removed_variant_reused.rs:8:5
+  |
+8 |     Bow,
+  |     ^^^

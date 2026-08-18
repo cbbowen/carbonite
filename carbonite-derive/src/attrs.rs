@@ -4,8 +4,10 @@
 
 use proc_macro2::TokenStream as TokenStream2;
 use syn::meta::ParseNestedMeta;
-use syn::{LitStr, Path, parse_quote};
+use syn::parse::Parse;
+use syn::{Lit, LitStr, Path, Token, parse_quote};
 
+use crate::removed::Retired;
 use crate::rename::{RenameRule, parse_rename_rule};
 
 /// The container's own carbonite attributes.
@@ -15,12 +17,16 @@ pub(crate) struct CarboniteAttrs {
     /// `#[carbonite(as = "...")]`: the type this one is represented as on the
     /// wire, in *both* directions.
     pub(crate) repr: Option<syn::Type>,
+    /// `#[carbonite(removed(...))]`: slots this type has retired, which
+    /// nothing may claim again. See [`crate::removed`].
+    pub(crate) removed: Vec<Retired>,
 }
 
 pub(crate) fn parse_carbonite_attrs(attrs: &[syn::Attribute]) -> syn::Result<CarboniteAttrs> {
     let mut out = CarboniteAttrs {
         krate: parse_quote!(::carbonite),
         repr: None,
+        removed: Vec::new(),
     };
     for attr in attrs {
         if !attr.path().is_ident("carbonite") {
@@ -33,15 +39,53 @@ pub(crate) fn parse_carbonite_attrs(attrs: &[syn::Attribute]) -> syn::Result<Car
             } else if meta.path.is_ident("as") {
                 out.repr = Some(meta.value()?.parse::<LitStr>()?.parse()?);
                 Ok(())
+            } else if meta.path.is_ident("removed") {
+                out.removed.extend(parse_removed(&meta)?);
+                Ok(())
             } else {
                 Err(meta.error(
-                    "unrecognized carbonite container attribute; the two are \
-                     `crate = \"...\"` and `as = \"...\"`",
+                    "unrecognized carbonite container attribute; the three are \
+                     `crate = \"...\"`, `as = \"...\"`, and `removed(...)`",
                 ))
             }
         })?;
     }
     Ok(out)
+}
+
+/// A variant's own carbonite attributes, which are only its retirements.
+pub(crate) fn parse_carbonite_variant_attrs(attrs: &[syn::Attribute]) -> syn::Result<Vec<Retired>> {
+    let mut out = Vec::new();
+    for attr in attrs {
+        if !attr.path().is_ident("carbonite") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("removed") {
+                out.extend(parse_removed(&meta)?);
+                Ok(())
+            } else {
+                Err(meta.error(
+                    "unrecognized carbonite variant attribute; the only one is `removed(...)`",
+                ))
+            }
+        })?;
+    }
+    Ok(out)
+}
+
+/// `removed("name", 1, ...)`: a parenthesized list rather than a value, since
+/// a type accumulates retirements over its life.
+fn parse_removed(meta: &ParseNestedMeta) -> syn::Result<Vec<Retired>> {
+    if !meta.input.peek(syn::token::Paren) {
+        return Err(
+            meta.error("write the retired slots as a list: `removed(\"old_name\")`, `removed(1)`")
+        );
+    }
+    let content;
+    syn::parenthesized!(content in meta.input);
+    let items = content.parse_terminated(Lit::parse, Token![,])?;
+    items.iter().map(Retired::parse).collect()
 }
 
 #[derive(Default)]
@@ -68,6 +112,9 @@ pub(crate) struct Conversion {
 #[derive(Default)]
 pub(crate) struct FieldAttrs {
     pub(crate) rename: Option<String>,
+    /// `#[serde(alias)]`: names this field also answers to, which is another
+    /// way to claim a retired slot. See [`crate::removed`].
+    pub(crate) aliases: Vec<String>,
     pub(crate) skip: bool,
     /// `#[carbonite(serde)]`: take this field's schema from a runtime trace
     /// and route its data through the serde path.
@@ -77,6 +124,7 @@ pub(crate) struct FieldAttrs {
 #[derive(Default)]
 pub(crate) struct VariantAttrs {
     pub(crate) rename: Option<String>,
+    pub(crate) aliases: Vec<String>,
     pub(crate) rename_all: Option<RenameRule>,
     pub(crate) skip: bool,
 }
@@ -146,6 +194,12 @@ pub(crate) fn parse_field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAt
                     out.fallback = true;
                     fallback_attr = Some(attr);
                     Ok(())
+                } else if meta.path.is_ident("removed") {
+                    Err(meta.error(
+                        "a retirement names a slot that no longer has a field of its own, \
+                         so it goes on the container or the variant rather than on a field: \
+                         `#[carbonite(removed(\"old_name\"))]`",
+                    ))
                 } else {
                     Err(meta.error(
                         "unrecognized carbonite field attribute; the only one is `serde`, \
@@ -161,6 +215,8 @@ pub(crate) fn parse_field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAt
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("rename") {
                 out.rename = Some(expect_str_value(&meta)?);
+            } else if meta.path.is_ident("alias") {
+                out.aliases.push(expect_str_value(&meta)?);
             } else if meta.path.is_ident("skip") {
                 out.skip = true;
             } else if meta.path.is_ident("skip_serializing")
@@ -212,6 +268,8 @@ pub(crate) fn parse_variant_attrs(attrs: &[syn::Attribute]) -> syn::Result<Varia
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("rename") {
                 out.rename = Some(expect_str_value(&meta)?);
+            } else if meta.path.is_ident("alias") {
+                out.aliases.push(expect_str_value(&meta)?);
             } else if meta.path.is_ident("rename_all") {
                 out.rename_all = Some(parse_rename_rule(&meta)?);
             } else if meta.path.is_ident("skip") {

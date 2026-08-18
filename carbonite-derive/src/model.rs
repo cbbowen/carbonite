@@ -7,7 +7,8 @@ use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Fields, Index, Member, Path, parse_quote};
 
-use crate::attrs::{parse_field_attrs, parse_variant_attrs};
+use crate::attrs::{FieldAttrs, VariantAttrs, parse_field_attrs, parse_variant_attrs};
+use crate::rename::RenameRule;
 
 pub(crate) struct FieldModel<'a> {
     pub(crate) member: Member,
@@ -39,6 +40,35 @@ pub(crate) fn field_models(fields: &Fields) -> syn::Result<Vec<FieldModel<'_>>> 
             })
         })
         .collect()
+}
+
+/// A named field's wire name: `#[serde(rename)]` if it has one, else its
+/// ident under whichever `rename_all` rule applies. Shared with
+/// [`crate::removed`] so a retirement is checked against the same name the
+/// schema records.
+pub(crate) fn field_wire_name(
+    ident: &syn::Ident,
+    attrs: &FieldAttrs,
+    rule: Option<RenameRule>,
+) -> String {
+    let ident = strip_raw(&ident.to_string());
+    attrs.rename.clone().unwrap_or_else(|| match rule {
+        Some(rule) => rule.apply_to_field(&ident),
+        None => ident,
+    })
+}
+
+/// As [`field_wire_name`], for a variant.
+pub(crate) fn variant_wire_name(
+    ident: &syn::Ident,
+    attrs: &VariantAttrs,
+    rule: Option<RenameRule>,
+) -> String {
+    let ident = strip_raw(&ident.to_string());
+    attrs.rename.clone().unwrap_or_else(|| match rule {
+        Some(rule) => rule.apply_to_variant(&ident),
+        None => ident,
+    })
 }
 
 /// One field's schema node. A `#[carbonite(serde)]` field has no compile-time

@@ -1,0 +1,5 @@
+error: an enum's variants are matched by name rather than by position — the tag on the wire indexes the writer's list — so retire the variant's name instead
+ --> tests/ui/removed_position_on_enum.rs:4:21
+  |
+4 | #[carbonite(removed(1))]
+  |                     ^

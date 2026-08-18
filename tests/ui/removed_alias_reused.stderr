@@ -1,0 +1,13 @@
+error: this alias claims the retired name `hp`: data written while the old field held it still carries that column, and the alias reads it into this field
+ --> tests/ui/removed_alias_reused.rs:8:5
+  |
+8 | /     #[serde(alias = "hp")]
+9 | |     health: f32,
+  | |_______________^
+
+error: this alias claims the retired name `1`: data written while the old field held it still carries that column, and the alias reads it into this field
+  --> tests/ui/removed_alias_reused.rs:17:5
+   |
+17 | /     #[serde(alias = "1")]
+18 | |     y: f32,
+   | |__________^

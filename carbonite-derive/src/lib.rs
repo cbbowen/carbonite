@@ -11,7 +11,7 @@
 //! cannot represent (`flatten`, `untagged`, `tag`/`content`, `with`, `remote`,
 //! identifier types, `skip_serializing_if`, and asymmetric skips).
 //!
-//! Three carbonite attributes of its own:
+//! Four carbonite attributes of its own:
 //!
 //! - `#[carbonite(crate = "...")]` on the container points the generated code
 //!   at a renamed carbonite dependency.
@@ -24,11 +24,17 @@
 //!   machinery: its schema comes from a runtime trace and its data goes
 //!   through the serde path, which is what makes foreign types that only ship
 //!   serde impls usable in a derived struct. See `carbonite::fallback`.
+//! - `#[carbonite(removed(...))]` on a container or variant records the field
+//!   names, variant names, and tuple positions the type has retired, so that
+//!   nothing claims one again. Removing a field is safe and adding one is
+//!   safe, but a new field landing on an old one's name or position reads its
+//!   dead column, and no comparison of schemas can see it. See [`removed`].
 //!
 //! The modules split along the derive's phases: [`attrs`] parses and vets the
 //! attributes, [`model`] decides which fields reach the wire and what each
-//! generic parameter needs, [`schema`] builds the schema-tree expression, and
-//! [`columnar`] generates the fast-path readers and writers.
+//! generic parameter needs, [`removed`] vets retirements, [`schema`] builds
+//! the schema-tree expression, and [`columnar`] generates the fast-path
+//! readers and writers.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -39,6 +45,7 @@ mod as_repr;
 mod attrs;
 mod columnar;
 mod model;
+mod removed;
 mod rename;
 mod schema;
 
@@ -57,12 +64,24 @@ pub fn derive_schema(input: TokenStream) -> TokenStream {
 }
 
 fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
-    let CarboniteAttrs { krate, repr } = parse_carbonite_attrs(&input.attrs)?;
+    let CarboniteAttrs {
+        krate,
+        repr,
+        removed,
+    } = parse_carbonite_attrs(&input.attrs)?;
     let container = parse_container_attrs(&input.attrs)?;
 
     // `#[carbonite(as = "...")]` replaces the whole field-based derivation: the
     // fields are not what reaches the wire.
     if let Some(repr) = &repr {
+        if let Some(entry) = removed.first() {
+            return Err(syn::Error::new(
+                entry.span,
+                "`as` replaces the field-based derivation, so this type's own fields never \
+                 reach the wire and it has no slots of its own to retire; the retirement \
+                 belongs on the wire type",
+            ));
+        }
         return as_repr::expand_as(input, &container, repr, &krate);
     }
     if let Some(conversion) = container.de_repr.as_ref().or(container.ser_repr.as_ref()) {
@@ -81,6 +100,17 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         .rename
         .clone()
         .unwrap_or_else(|| strip_raw(&input.ident.to_string()));
+
+    match &input.data {
+        Data::Struct(data) => removed::check_fields(&removed, &data.fields, container.rename_all)?,
+        Data::Enum(data) => removed::check_enum(
+            &removed,
+            data,
+            container.rename_all,
+            container.rename_all_fields,
+        )?,
+        Data::Union(_) => {}
+    }
 
     let (body, parts) = match &input.data {
         Data::Struct(data) => (

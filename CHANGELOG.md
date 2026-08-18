@@ -20,6 +20,13 @@ The wire format's own compatibility promises live with `SCHEMA_VERSION` and
 - A `shared` cargo feature (on by default) gating the `Shared`/`SharedArc`
   wrapper API. Blobs holding shared columns still decode with the feature off
   (repeats excepted).
+- `#[carbonite(removed(...))]` on a container or variant records retired field
+  names, variant names, and tuple positions, and the derive rejects anything
+  that claims one again — by name, by position, or by `#[serde(alias)]`.
+  Removing a field and adding one are each compatible changes whose
+  composition is not: the new field reads the removed one's column, and where
+  the two types agree the schemas are byte-identical, so no schema comparison
+  can detect it. Retirements are compile-time only and do not reach the wire.
 - `Option<T>` now widens to a sequence: a field that was an `Option` reads into
   `Vec<T>` (or any other sequence reader), `None` as empty and `Some` as one
   element. The wire is unchanged — a presence byte and a varint count of `0`/`1`
