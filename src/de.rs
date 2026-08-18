@@ -15,7 +15,7 @@
 //! it by declaration order instead would not compose with reordering named
 //! fields, which is already a no-op; see [`positional_names`] and
 //! [`needs_positional_names`]. The reverse — a named file read into a tuple —
-//! is refused, since a tuple has nowhere to make that declaration.
+//! is refused, since a tuple has nowhere to put the declaration.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -30,8 +30,8 @@ use serde::de::{
 
 use crate::columnar::{ColumnCursor as Cursor, DeserializeColumns, checked_count};
 use crate::error::{Error, Result};
-use crate::layout::{LNode, Layout};
-use crate::schema::{Primitive, Schema, SchemaNode, VariantNode};
+use crate::layout::{Layout, Node, VariantKind};
+use crate::schema::{Primitive, Schema};
 
 /// Deserializes values of type `T` from blobs written with a given schema.
 ///
@@ -305,8 +305,7 @@ where
         self.remaining -= 1;
         let _shared_scope = crate::shared::RowScope::begin();
         let result = T::deserialize(ValueDeserializer {
-            node: self.de.schema.node(),
-            lnode: &self.de.layout.root,
+            node: &self.de.layout.root,
             cursors: &mut self.cursors,
             fast: self.de.fast,
         })
@@ -488,14 +487,12 @@ fn named_into_positional() -> Error {
 /// one of the writer's fields and ignores the ones it does not know.
 fn visit_numbered<'s, 'de, V: Visitor<'de>>(
     fields: FieldList<'s>,
-    lfields: &'s [LNode],
     cursors: &mut [Cursor<'de>],
     fast: bool,
     visitor: V,
 ) -> Result<V::Value> {
     visitor.visit_map(NumberedMap {
         fields,
-        lfields,
         cursors,
         index: 0,
         fast,
@@ -512,7 +509,6 @@ fn visit_numbered<'s, 'de, V: Visitor<'de>>(
 /// bytes.
 fn visit_product<'s, 'de, V: Visitor<'de>>(
     fields: FieldList<'s>,
-    lfields: &'s [LNode],
     cursors: &mut [Cursor<'de>],
     fast: bool,
     visitor: V,
@@ -523,7 +519,6 @@ fn visit_product<'s, 'de, V: Visitor<'de>>(
     if fast {
         return visitor.visit_seq(FieldsSeq {
             fields,
-            lfields,
             cursors,
             index: 0,
             fast,
@@ -536,15 +531,14 @@ fn visit_product<'s, 'de, V: Visitor<'de>>(
     // never asked for still have to be skipped.
     let mut seq = FieldsSeq {
         fields,
-        lfields,
         cursors: &mut *cursors,
         index: 0,
         fast,
     };
     let value = visitor.visit_seq(&mut seq)?;
     let mut index = seq.index;
-    while let Some((node, lnode)) = fields.get(index).zip(lfields.get(index)) {
-        ValueDeserializer::skip(node, lnode, cursors)?;
+    while let Some(node) = fields.get(index) {
+        ValueDeserializer::skip(node, cursors)?;
         index += 1;
     }
     Ok(value)
@@ -559,14 +553,12 @@ fn visit_product<'s, 'de, V: Visitor<'de>>(
 /// [`crate::fallback`]). `fast` selects positional struct decoding, which is
 /// correct exactly when `node` came from the reading type itself.
 pub(crate) fn deserialize_value<'de, T: Deserialize<'de>>(
-    node: &SchemaNode,
-    lnode: &LNode,
+    node: &Node,
     cursors: &mut [Cursor<'de>],
     fast: bool,
 ) -> Result<T> {
     T::deserialize(ValueDeserializer {
         node,
-        lnode,
         cursors,
         fast,
     })
@@ -578,8 +570,7 @@ pub(crate) fn deserialize_value<'de, T: Deserialize<'de>>(
 
 /// Deserializes one value position, driven entirely by the file schema.
 struct ValueDeserializer<'s, 'c, 'de> {
-    node: &'s SchemaNode,
-    lnode: &'s LNode,
+    node: &'s Node,
     cursors: &'c mut [Cursor<'de>],
     fast: bool,
 }
@@ -589,8 +580,8 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
     /// visitor. Because the schema is in hand, this format is effectively
     /// self-describing at read time.
     fn dispatch<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        match (self.node, self.lnode) {
-            (SchemaNode::Primitive(p), LNode::Primitive(col)) => {
+        match self.node {
+            Node::Primitive(p, col) => {
                 let cursor = &mut self.cursors[*col];
                 match p {
                     Primitive::Bool => match cursor.byte()? {
@@ -623,124 +614,97 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                     }
                 }
             }
-            (SchemaNode::String, LNode::Str { len, data }) => {
+            Node::Str {
+                bytes: false,
+                len,
+                data,
+            } => {
                 let n = self.cursors[*len].varint_len()?;
                 let bytes = self.cursors[*data].take(n)?;
                 let s = std::str::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)?;
                 visitor.visit_borrowed_str(s)
             }
-            (SchemaNode::Bytes, LNode::Str { len, data }) => {
+            Node::Str {
+                bytes: true,
+                len,
+                data,
+            } => {
                 let n = self.cursors[*len].varint_len()?;
                 visitor.visit_borrowed_bytes(self.cursors[*data].take(n)?)
             }
-            (SchemaNode::Unit | SchemaNode::UnitStruct { .. }, LNode::Unit) => visitor.visit_unit(),
+            Node::Unit { .. } => visitor.visit_unit(),
             // A newtype struct occupies exactly its inner value's columns, so
             // the wrapper is invisible on the wire and a reader that is not
             // asking for one simply sees through it. A reader that *is* asking
             // never arrives here — `deserialize_newtype_struct` hands it the
             // wrapper itself.
-            (SchemaNode::NewtypeStruct { inner, .. }, LNode::Newtype(linner)) => {
-                ValueDeserializer {
+            Node::Newtype { inner, .. } => ValueDeserializer {
+                node: inner,
+                cursors: self.cursors,
+                fast: self.fast,
+            }
+            .dispatch(visitor),
+            Node::Option { tag, inner } => match self.cursors[*tag].byte()? {
+                0 => visitor.visit_none(),
+                1 => visitor.visit_some(ValueDeserializer {
                     node: inner,
-                    lnode: linner,
                     cursors: self.cursors,
                     fast: self.fast,
-                }
-                .dispatch(visitor)
-            }
-            (SchemaNode::Option(inner), LNode::Option { tag, inner: linner }) => {
-                match self.cursors[*tag].byte()? {
-                    0 => visitor.visit_none(),
-                    1 => visitor.visit_some(ValueDeserializer {
-                        node: inner,
-                        lnode: linner,
-                        cursors: self.cursors,
-                        fast: self.fast,
-                    }),
-                    other => Err(Error::InvalidTag {
-                        what: "presence",
-                        value: u64::from(other),
-                    }),
-                }
-            }
-            (
-                SchemaNode::Seq(elem),
-                LNode::Seq {
-                    len,
-                    elem: lelem,
-                    elem_columns,
-                },
-            ) => {
+                }),
+                other => Err(Error::InvalidTag {
+                    what: "presence",
+                    value: u64::from(other),
+                }),
+            },
+            Node::Seq {
+                len,
+                elem,
+                elem_columns,
+            } => {
                 let claimed = self.cursors[*len].varint()?;
                 let remaining =
                     checked_count("sequence length", *elem_columns, claimed, self.cursors)? as u64;
                 visitor.visit_seq(ColSeq {
                     node: elem,
-                    lnode: lelem,
                     cursors: self.cursors,
                     remaining,
                     fast: self.fast,
                 })
             }
-            (
-                SchemaNode::Tuple(fields) | SchemaNode::TupleStruct { fields, .. },
-                LNode::Product(lfields),
-            ) => visit_product(
-                FieldList::Plain(fields),
-                lfields,
-                self.cursors,
-                self.fast,
-                visitor,
-            ),
-            (
-                SchemaNode::Map { key, value },
-                LNode::Map {
-                    len,
-                    key: lkey,
-                    value: lvalue,
-                    entry_columns,
-                },
-            ) => {
+            Node::Tuple { fields, .. } => {
+                visit_product(FieldList::Plain(fields), self.cursors, self.fast, visitor)
+            }
+            Node::Map {
+                len,
+                key,
+                value,
+                entry_columns,
+            } => {
                 let claimed = self.cursors[*len].varint()?;
                 let remaining =
                     checked_count("map length", *entry_columns, claimed, self.cursors)? as u64;
                 visitor.visit_map(ColMap {
                     key,
-                    lkey,
                     value,
-                    lvalue,
                     cursors: self.cursors,
                     remaining,
                     awaiting_value: false,
                     fast: self.fast,
                 })
             }
-            (SchemaNode::Struct { fields, .. }, LNode::Product(lfields)) => {
+            Node::Struct { fields, .. } => {
                 if self.fast {
-                    visit_product(
-                        FieldList::Named(fields),
-                        lfields,
-                        self.cursors,
-                        self.fast,
-                        visitor,
-                    )
+                    visit_product(FieldList::Named(fields), self.cursors, self.fast, visitor)
                 } else {
                     visitor.visit_map(StructMap {
                         fields,
-                        lfields,
                         cursors: self.cursors,
                         index: 0,
                         fast: self.fast,
                     })
                 }
             }
-            (
-                SchemaNode::Enum { variants, .. },
-                LNode::Enum {
-                    tag,
-                    variants: lvariants,
-                },
-            ) => {
+            Node::Enum { tag, variants, .. } => {
                 let raw = self.cursors[*tag].varint()?;
                 let index = usize::try_from(raw)
                     .ok()
@@ -749,11 +713,10 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                         what: "enum variant",
                         value: raw,
                     })?;
-                let (name, shape) = &variants[index];
+                let variant = &variants[index];
                 visitor.visit_enum(ColEnum {
-                    name,
-                    shape,
-                    lnode: &lvariants[index],
+                    name: &variant.name,
+                    kind: &variant.kind,
                     cursors: self.cursors,
                     fast: self.fast,
                 })
@@ -762,7 +725,7 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
             // used to be plain, or IgnoredAny): first occurrences
             // materialize transparently; repeats cannot (there is no stored
             // value to clone) and error via read_slot.
-            (SchemaNode::Shared(inner), LNode::Shared { key, inner: linner }) => {
+            Node::Shared { key, inner } => {
                 let position = std::ptr::from_ref(&self.cursors[*key]) as usize;
                 let k = self.cursors[*key].varint()?;
                 match crate::shared::read_slot(position, k)? {
@@ -771,7 +734,6 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                         // a plain reader produces no shareable pointer.
                         ValueDeserializer {
                             node: inner,
-                            lnode: linner,
                             cursors: self.cursors,
                             fast: self.fast,
                         }
@@ -780,7 +742,6 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                     crate::shared::ReadSlot::Repeat(_) => Err(crate::shared::repeat_unavailable()),
                 }
             }
-            _ => unreachable!("layout was built from this schema"),
         }
     }
 
@@ -789,33 +750,14 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
     /// of fields in declaration order, which is what lets one replace another
     /// between versions — a unit being the empty list, so a type that stored
     /// nothing can grow fields as long as they have defaults.
-    fn product_fields(&self) -> Option<(FieldList<'s>, &'s [LNode])> {
-        match (self.node, self.lnode) {
-            (SchemaNode::Unit | SchemaNode::UnitStruct { .. }, LNode::Unit) => {
-                Some((FieldList::Plain(&[]), &[]))
-            }
-            (SchemaNode::NewtypeStruct { inner, .. }, LNode::Newtype(linner)) => Some((
-                FieldList::Plain(std::slice::from_ref(&**inner)),
-                std::slice::from_ref(&**linner),
-            )),
-            (
-                SchemaNode::Tuple(fields) | SchemaNode::TupleStruct { fields, .. },
-                LNode::Product(lfields),
-            ) => Some((FieldList::Plain(fields), lfields)),
-            (SchemaNode::Struct { fields, .. }, LNode::Product(lfields)) => {
-                Some((FieldList::Named(fields), lfields))
-            }
+    fn product_fields(&self) -> Option<FieldList<'s>> {
+        match self.node {
+            Node::Unit { .. } => Some(FieldList::Plain(&[])),
+            Node::Newtype { inner, .. } => Some(FieldList::Plain(std::slice::from_ref(&**inner))),
+            Node::Tuple { fields, .. } => Some(FieldList::Plain(fields)),
+            Node::Struct { fields, .. } => Some(FieldList::Named(fields)),
             _ => None,
         }
-    }
-
-    fn visit_product<V: Visitor<'de>>(
-        self,
-        fields: FieldList<'s>,
-        lfields: &'s [LNode],
-        visitor: V,
-    ) -> Result<V::Value> {
-        visit_product(fields, lfields, self.cursors, self.fast, visitor)
     }
 
     /// Reads any product shape positionally, for a reader asking for a tuple,
@@ -823,89 +765,72 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
     /// refused; see [`named_into_positional`].
     fn deserialize_positional<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         match self.product_fields() {
-            Some((FieldList::Named(_), _)) if !self.fast => Err(named_into_positional()),
-            Some((fields, lfields)) => self.visit_product(fields, lfields, visitor),
+            Some(FieldList::Named(_)) if !self.fast => Err(named_into_positional()),
+            Some(fields) => visit_product(fields, self.cursors, self.fast, visitor),
             None => self.dispatch(visitor),
         }
     }
 
     /// Advances every cursor past one value of `node` without materializing
     /// it. Used for fields the reading type does not know.
-    fn skip(node: &SchemaNode, lnode: &LNode, cursors: &mut [Cursor<'de>]) -> Result<()> {
-        match (node, lnode) {
-            (SchemaNode::Primitive(p), LNode::Primitive(col)) => {
+    fn skip(node: &Node, cursors: &mut [Cursor<'de>]) -> Result<()> {
+        match node {
+            Node::Primitive(p, col) => {
                 cursors[*col].take(p.width())?;
             }
-            (SchemaNode::String | SchemaNode::Bytes, LNode::Str { len, data }) => {
+            Node::Str { len, data, .. } => {
                 let n = cursors[*len].varint_len()?;
                 cursors[*data].take(n)?;
             }
-            (SchemaNode::Unit | SchemaNode::UnitStruct { .. }, LNode::Unit) => {}
-            (SchemaNode::NewtypeStruct { inner, .. }, LNode::Newtype(linner)) => {
-                Self::skip(inner, linner, cursors)?;
+            Node::Unit { .. } => {}
+            Node::Newtype { inner, .. } => {
+                Self::skip(inner, cursors)?;
             }
-            (SchemaNode::Option(inner), LNode::Option { tag, inner: linner }) => {
-                match cursors[*tag].byte()? {
-                    0 => {}
-                    1 => Self::skip(inner, linner, cursors)?,
-                    other => {
-                        return Err(Error::InvalidTag {
-                            what: "presence",
-                            value: u64::from(other),
-                        });
-                    }
+            Node::Option { tag, inner } => match cursors[*tag].byte()? {
+                0 => {}
+                1 => Self::skip(inner, cursors)?,
+                other => {
+                    return Err(Error::InvalidTag {
+                        what: "presence",
+                        value: u64::from(other),
+                    });
                 }
-            }
-            (
-                SchemaNode::Seq(elem),
-                LNode::Seq {
-                    len,
-                    elem: lelem,
-                    elem_columns,
-                },
-            ) => {
+            },
+            Node::Seq {
+                len,
+                elem,
+                elem_columns,
+            } => {
                 let claimed = cursors[*len].varint()?;
                 let n = checked_count("sequence length", *elem_columns, claimed, cursors)?;
                 for _ in 0..n {
-                    Self::skip(elem, lelem, cursors)?;
+                    Self::skip(elem, cursors)?;
                 }
             }
-            (
-                SchemaNode::Map { key, value },
-                LNode::Map {
-                    len,
-                    key: lkey,
-                    value: lvalue,
-                    entry_columns,
-                },
-            ) => {
+            Node::Map {
+                len,
+                key,
+                value,
+                entry_columns,
+            } => {
                 let claimed = cursors[*len].varint()?;
                 let n = checked_count("map length", *entry_columns, claimed, cursors)?;
                 for _ in 0..n {
-                    Self::skip(key, lkey, cursors)?;
-                    Self::skip(value, lvalue, cursors)?;
+                    Self::skip(key, cursors)?;
+                    Self::skip(value, cursors)?;
                 }
             }
-            (
-                SchemaNode::Tuple(fields) | SchemaNode::TupleStruct { fields, .. },
-                LNode::Product(lfields),
-            ) => {
-                for (field, lfield) in fields.iter().zip(lfields) {
-                    Self::skip(field, lfield, cursors)?;
+            Node::Tuple { fields, .. } => {
+                for field in fields {
+                    Self::skip(field, cursors)?;
                 }
             }
-            (SchemaNode::Struct { fields, .. }, LNode::Product(lfields)) => {
-                for ((_, field), lfield) in fields.iter().zip(lfields) {
-                    Self::skip(field, lfield, cursors)?;
+            Node::Struct { fields, .. } => {
+                for (_, field) in fields {
+                    Self::skip(field, cursors)?;
                 }
             }
-            (
-                SchemaNode::Enum { variants, .. },
-                LNode::Enum {
-                    tag,
-                    variants: lvariants,
-                },
-            ) => {
+            Node::Enum { tag, variants, .. } => {
                 let raw = cursors[*tag].varint()?;
                 let index = usize::try_from(raw)
                     .ok()
@@ -914,48 +839,44 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                         what: "enum variant",
                         value: raw,
                     })?;
-                Self::skip_variant(&variants[index].1, &lvariants[index], cursors)?;
+                Self::skip_variant(&variants[index].kind, cursors)?;
             }
-            (SchemaNode::Shared(inner), LNode::Shared { key, inner: linner }) => {
+            Node::Shared { key, inner } => {
                 let position = std::ptr::from_ref(&cursors[*key]) as usize;
                 let k = cursors[*key].varint()?;
                 // Only first occurrences carry a payload to skip.
                 if crate::shared::read_skip(position, k)? {
-                    Self::skip(inner, linner, cursors)?;
+                    Self::skip(inner, cursors)?;
                 }
             }
-            _ => unreachable!("layout was built from this schema"),
         }
         Ok(())
     }
 
-    fn skip_variant(shape: &VariantNode, lnode: &LNode, cursors: &mut [Cursor<'de>]) -> Result<()> {
-        match (shape, lnode) {
-            (VariantNode::Unit, LNode::Unit) => Ok(()),
-            (VariantNode::Newtype(inner), LNode::Newtype(linner)) => {
-                Self::skip(inner, linner, cursors)
-            }
-            (VariantNode::Tuple(fields), LNode::Product(lfields)) => {
-                for (field, lfield) in fields.iter().zip(lfields) {
-                    Self::skip(field, lfield, cursors)?;
+    fn skip_variant(kind: &VariantKind, cursors: &mut [Cursor<'de>]) -> Result<()> {
+        match kind {
+            VariantKind::Unit => Ok(()),
+            VariantKind::Newtype(inner) => Self::skip(inner, cursors),
+            VariantKind::Tuple(fields) => {
+                for field in fields {
+                    Self::skip(field, cursors)?;
                 }
                 Ok(())
             }
-            (VariantNode::Struct(fields), LNode::Product(lfields)) => {
-                for ((_, field), lfield) in fields.iter().zip(lfields) {
-                    Self::skip(field, lfield, cursors)?;
+            VariantKind::Struct(fields) => {
+                for (_, field) in fields {
+                    Self::skip(field, cursors)?;
                 }
                 Ok(())
             }
-            _ => unreachable!("layout was built from this schema"),
         }
     }
 
     /// Runs the shared-value protocol for a `carbonite::Shared`/`SharedArc`
     /// wrapper (recognized by its sentinel newtype name).
     fn deserialize_shared_wrapper<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        match (self.node, self.lnode) {
-            (SchemaNode::Shared(inner), LNode::Shared { key, inner: linner }) => {
+        match self.node {
+            Node::Shared { key, inner } => {
                 let position = std::ptr::from_ref(&self.cursors[*key]) as usize;
                 let k = self.cursors[*key].varint()?;
                 match crate::shared::read_slot(position, k)? {
@@ -972,7 +893,6 @@ impl<'s, 'de> ValueDeserializer<'s, '_, 'de> {
                     crate::shared::ReadSlot::New(reserved) => {
                         let value = visitor.visit_newtype_struct(ValueDeserializer {
                             node: inner,
-                            lnode: linner,
                             cursors: self.cursors,
                             fast: self.fast,
                         })?;
@@ -1022,7 +942,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        if matches!(self.node, SchemaNode::Option(_)) {
+        if matches!(self.node, Node::Option { .. }) {
             self.dispatch(visitor)
         } else {
             // The file has a bare value where the type now expects an Option:
@@ -1033,7 +953,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
     }
 
     fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        Self::skip(self.node, self.lnode, self.cursors)?;
+        Self::skip(self.node, self.cursors)?;
         visitor.visit_unit()
     }
 
@@ -1048,22 +968,16 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
         match self.node {
             // Same shape: unwrap one layer and hand the inside to the reader's
             // own newtype visitor.
-            SchemaNode::NewtypeStruct { inner, .. } => match self.lnode {
-                LNode::Newtype(linner) => visitor.visit_newtype_struct(ValueDeserializer {
-                    node: inner,
-                    lnode: linner,
-                    cursors: self.cursors,
-                    fast: self.fast,
-                }),
-                _ => unreachable!("layout was built from this schema"),
-            },
+            Node::Newtype { inner, .. } => visitor.visit_newtype_struct(ValueDeserializer {
+                node: inner,
+                cursors: self.cursors,
+                fast: self.fast,
+            }),
             // A product of fields is read positionally, so a one-field writer
             // lands in the wrapper and any other arity is reported by serde.
-            SchemaNode::Struct { .. }
-            | SchemaNode::Tuple(_)
-            | SchemaNode::TupleStruct { .. }
-            | SchemaNode::Unit
-            | SchemaNode::UnitStruct { .. } => self.deserialize_positional(visitor),
+            Node::Struct { .. } | Node::Tuple { .. } | Node::Unit { .. } => {
+                self.deserialize_positional(visitor)
+            }
             // Anything else is a plain value the reader has since wrapped: the
             // wrapper occupies no columns of its own, so the value goes
             // straight into it. This is what makes `u32` -> `Layer(u32)` a
@@ -1085,25 +999,15 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
     ) -> Result<V::Value> {
         // The writer recorded names too — far and away the common case, so it
         // is handled here rather than round-tripping through `dispatch`.
-        if let (
-            SchemaNode::Struct {
-                fields: written, ..
-            },
-            LNode::Product(lfields),
-        ) = (self.node, self.lnode)
+        if let Node::Struct {
+            fields: written, ..
+        } = self.node
         {
             return if self.fast {
-                visit_product(
-                    FieldList::Named(written),
-                    lfields,
-                    self.cursors,
-                    self.fast,
-                    visitor,
-                )
+                visit_product(FieldList::Named(written), self.cursors, self.fast, visitor)
             } else {
                 visitor.visit_map(StructMap {
                     fields: written,
-                    lfields,
                     cursors: self.cursors,
                     index: 0,
                     fast: self.fast,
@@ -1111,7 +1015,6 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
             };
         }
         match self.product_fields() {
-            Some((FieldList::Named(_), _)) => self.dispatch(visitor),
             // Not a product at all: a plain value the reader has since
             // promoted to a struct of its own. It is a one-field product whose
             // single position is the value itself, so `u32` -> `Layer(u32)` ->
@@ -1120,7 +1023,6 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
             // an ordinary type mismatch and serde should say so.
             None if positional_names(fields, 1) => visit_numbered(
                 FieldList::Plain(std::slice::from_ref(self.node)),
-                std::slice::from_ref(self.lnode),
                 self.cursors,
                 self.fast,
                 visitor,
@@ -1128,12 +1030,12 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
             None => self.dispatch(visitor),
             // No positions to declare: the writer stored nothing, so every
             // field the reader has now is missing and falls to its default.
-            Some((positional, lfields)) if positional.len() == 0 => {
-                visit_numbered(positional, lfields, self.cursors, self.fast, visitor)
+            Some(positional) if positional.len() == 0 => {
+                visit_numbered(positional, self.cursors, self.fast, visitor)
             }
-            Some((positional, lfields)) => {
+            Some(positional) => {
                 if positional_names(fields, positional.len()) {
-                    visit_numbered(positional, lfields, self.cursors, self.fast, visitor)
+                    visit_numbered(positional, self.cursors, self.fast, visitor)
                 } else {
                     Err(needs_positional_names(positional.len()))
                 }
@@ -1144,7 +1046,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
     /// The reader stores nothing here any more. Whatever the writer put in
     /// this position is skipped, the same as a field the reader has dropped.
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        Self::skip(self.node, self.lnode, self.cursors)?;
+        Self::skip(self.node, self.cursors)?;
         visitor.visit_unit()
     }
 
@@ -1187,8 +1089,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
 
 /// Sequence elements, length-driven.
 struct ColSeq<'s, 'c, 'de> {
-    node: &'s SchemaNode,
-    lnode: &'s LNode,
+    node: &'s Node,
     cursors: &'c mut [Cursor<'de>],
     remaining: u64,
     fast: bool,
@@ -1204,7 +1105,6 @@ impl<'de> SeqAccess<'de> for ColSeq<'_, '_, 'de> {
         self.remaining -= 1;
         seed.deserialize(ValueDeserializer {
             node: self.node,
-            lnode: self.lnode,
             cursors: self.cursors,
             fast: self.fast,
         })
@@ -1216,14 +1116,15 @@ impl<'de> SeqAccess<'de> for ColSeq<'_, '_, 'de> {
     }
 }
 
+/// One product's fields, with or without the names the writer recorded.
 #[derive(Clone, Copy)]
 enum FieldList<'s> {
-    Plain(&'s [SchemaNode]),
-    Named(&'s [(String, SchemaNode)]),
+    Plain(&'s [Node]),
+    Named(&'s [(String, Node)]),
 }
 
 impl<'s> FieldList<'s> {
-    fn get(&self, index: usize) -> Option<&'s SchemaNode> {
+    fn get(&self, index: usize) -> Option<&'s Node> {
         match self {
             FieldList::Plain(fields) => fields.get(index),
             FieldList::Named(fields) => fields.get(index).map(|(_, field)| field),
@@ -1241,7 +1142,6 @@ impl<'s> FieldList<'s> {
 /// Positional fields: tuples, tuple structs/variants, and fast-path structs.
 struct FieldsSeq<'s, 'c, 'de> {
     fields: FieldList<'s>,
-    lfields: &'s [LNode],
     cursors: &'c mut [Cursor<'de>],
     index: usize,
     fast: bool,
@@ -1251,17 +1151,12 @@ impl<'de> SeqAccess<'de> for FieldsSeq<'_, '_, 'de> {
     type Error = Error;
 
     fn next_element_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<Option<S::Value>> {
-        let Some((node, lnode)) = self
-            .fields
-            .get(self.index)
-            .zip(self.lfields.get(self.index))
-        else {
+        let Some(node) = self.fields.get(self.index) else {
             return Ok(None);
         };
         self.index += 1;
         seed.deserialize(ValueDeserializer {
             node,
-            lnode,
             cursors: self.cursors,
             fast: self.fast,
         })
@@ -1276,8 +1171,7 @@ impl<'de> SeqAccess<'de> for FieldsSeq<'_, '_, 'de> {
 /// Name-matched struct fields (the evolution path): keys come from the file
 /// schema; the visitor matches them against the type's fields.
 struct StructMap<'s, 'c, 'de> {
-    fields: &'s [(String, SchemaNode)],
-    lfields: &'s [LNode],
+    fields: &'s [(String, Node)],
     cursors: &'c mut [Cursor<'de>],
     index: usize,
     fast: bool,
@@ -1294,16 +1188,13 @@ impl<'de> MapAccess<'de> for StructMap<'_, '_, 'de> {
     }
 
     fn next_value_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<S::Value> {
-        let (node, lnode) = self
+        let (_, node) = self
             .fields
             .get(self.index)
-            .map(|(_, field)| field)
-            .zip(self.lfields.get(self.index))
             .expect("next_value_seed called after next_key_seed returned a key");
         self.index += 1;
         seed.deserialize(ValueDeserializer {
             node,
-            lnode,
             cursors: self.cursors,
             fast: self.fast,
         })
@@ -1318,7 +1209,6 @@ impl<'de> MapAccess<'de> for StructMap<'_, '_, 'de> {
 /// [`positional_names`].
 struct NumberedMap<'s, 'c, 'de> {
     fields: FieldList<'s>,
-    lfields: &'s [LNode],
     cursors: &'c mut [Cursor<'de>],
     index: usize,
     fast: bool,
@@ -1336,15 +1226,13 @@ impl<'de> MapAccess<'de> for NumberedMap<'_, '_, 'de> {
     }
 
     fn next_value_seed<S: DeserializeSeed<'de>>(&mut self, seed: S) -> Result<S::Value> {
-        let (node, lnode) = self
+        let node = self
             .fields
             .get(self.index)
-            .zip(self.lfields.get(self.index))
             .expect("next_value_seed called after next_key_seed returned a key");
         self.index += 1;
         seed.deserialize(ValueDeserializer {
             node,
-            lnode,
             cursors: self.cursors,
             fast: self.fast,
         })
@@ -1357,10 +1245,8 @@ impl<'de> MapAccess<'de> for NumberedMap<'_, '_, 'de> {
 
 /// Map entries, length-driven.
 struct ColMap<'s, 'c, 'de> {
-    key: &'s SchemaNode,
-    lkey: &'s LNode,
-    value: &'s SchemaNode,
-    lvalue: &'s LNode,
+    key: &'s Node,
+    value: &'s Node,
     cursors: &'c mut [Cursor<'de>],
     remaining: u64,
     awaiting_value: bool,
@@ -1378,7 +1264,6 @@ impl<'de> MapAccess<'de> for ColMap<'_, '_, 'de> {
         self.awaiting_value = true;
         seed.deserialize(ValueDeserializer {
             node: self.key,
-            lnode: self.lkey,
             cursors: self.cursors,
             fast: self.fast,
         })
@@ -1396,7 +1281,6 @@ impl<'de> MapAccess<'de> for ColMap<'_, '_, 'de> {
         self.awaiting_value = false;
         seed.deserialize(ValueDeserializer {
             node: self.value,
-            lnode: self.lvalue,
             cursors: self.cursors,
             fast: self.fast,
         })
@@ -1411,8 +1295,7 @@ impl<'de> MapAccess<'de> for ColMap<'_, '_, 'de> {
 /// the payload per the file's shape for that variant.
 struct ColEnum<'s, 'c, 'de> {
     name: &'s str,
-    shape: &'s VariantNode,
-    lnode: &'s LNode,
+    kind: &'s VariantKind,
     cursors: &'c mut [Cursor<'de>],
     fast: bool,
 }
@@ -1433,25 +1316,24 @@ impl<'de> VariantAccess<'de> for ColEnum<'_, '_, 'de> {
     /// The reader's variant carries nothing any more, so whatever payload the
     /// writer stored is skipped — the same as a field the reader has dropped.
     fn unit_variant(self) -> Result<()> {
-        ValueDeserializer::skip_variant(self.shape, self.lnode, self.cursors)
+        ValueDeserializer::skip_variant(self.kind, self.cursors)
     }
 
     fn newtype_variant_seed<S: DeserializeSeed<'de>>(self, seed: S) -> Result<S::Value> {
         // A newtype variant is a one-field product, so any positional writer
         // shape holding exactly one field reads into it.
         match self.payload_fields() {
-            Some((FieldList::Named(_), _)) if !self.fast => Err(named_into_positional()),
-            Some((fields, lfields)) if fields.len() == 1 => {
+            FieldList::Named(_) if !self.fast => Err(named_into_positional()),
+            fields if fields.len() == 1 => {
                 let node = fields.get(0).expect("len checked");
                 seed.deserialize(ValueDeserializer {
                     node,
-                    lnode: &lfields[0],
                     fast: self.fast,
                     cursors: self.cursors,
                 })
             }
             _ => Err(Error::SchemaMismatch {
-                expected: variant_shape_name(self.shape).to_owned(),
+                expected: variant_shape_name(self.kind).to_owned(),
                 found: format!("newtype variant `{}`", self.name),
             }),
         }
@@ -1459,14 +1341,8 @@ impl<'de> VariantAccess<'de> for ColEnum<'_, '_, 'de> {
 
     fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value> {
         match self.payload_fields() {
-            Some((FieldList::Named(_), _)) if !self.fast => Err(named_into_positional()),
-            Some((fields, lfields)) => {
-                visit_product(fields, lfields, self.cursors, self.fast, visitor)
-            }
-            None => Err(Error::SchemaMismatch {
-                expected: variant_shape_name(self.shape).to_owned(),
-                found: format!("tuple variant `{}`", self.name),
-            }),
+            FieldList::Named(_) if !self.fast => Err(named_into_positional()),
+            fields => visit_product(fields, self.cursors, self.fast, visitor),
         }
     }
 
@@ -1475,17 +1351,15 @@ impl<'de> VariantAccess<'de> for ColEnum<'_, '_, 'de> {
         fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value> {
-        match (self.shape, self.lnode) {
+        match self.kind {
             // The writer had named fields too: match by name, which is what
             // makes reordering and `#[serde(alias)]` work.
-            (VariantNode::Struct(wfields), LNode::Product(lfields)) if !self.fast => visitor
-                .visit_map(StructMap {
-                    fields: wfields,
-                    lfields,
-                    cursors: self.cursors,
-                    index: 0,
-                    fast: self.fast,
-                }),
+            VariantKind::Struct(wfields) if !self.fast => visitor.visit_map(StructMap {
+                fields: wfields,
+                cursors: self.cursors,
+                index: 0,
+                fast: self.fast,
+            }),
             // Otherwise the writer's payload was positional (or this is the
             // fast path, where positions already agree); see
             // [`positional_names`].
@@ -1493,23 +1367,17 @@ impl<'de> VariantAccess<'de> for ColEnum<'_, '_, 'de> {
                 // On the fast path the shapes are identical, so positions
                 // already agree and no declaration is needed. An empty payload
                 // has no positions to declare either.
-                Some((payload, lfields)) if self.fast => {
-                    visit_product(payload, lfields, self.cursors, self.fast, visitor)
+                payload if self.fast => visit_product(payload, self.cursors, self.fast, visitor),
+                payload if payload.len() == 0 => {
+                    visit_numbered(payload, self.cursors, self.fast, visitor)
                 }
-                Some((payload, lfields)) if payload.len() == 0 => {
-                    visit_numbered(payload, lfields, self.cursors, self.fast, visitor)
-                }
-                Some((payload, lfields)) => {
+                payload => {
                     if positional_names(fields, payload.len()) {
-                        visit_numbered(payload, lfields, self.cursors, self.fast, visitor)
+                        visit_numbered(payload, self.cursors, self.fast, visitor)
                     } else {
                         Err(needs_positional_names(payload.len()))
                     }
                 }
-                None => Err(Error::SchemaMismatch {
-                    expected: variant_shape_name(self.shape).to_owned(),
-                    found: format!("struct variant `{}`", self.name),
-                }),
             },
         }
     }
@@ -1520,34 +1388,24 @@ impl<'s> ColEnum<'s, '_, '_> {
     /// writer used. Every non-unit variant shape is a product of fields, so
     /// this is what lets a variant change shape between versions: a newtype,
     /// tuple, or struct payload all present the same way to a reader that
-    /// asks for a different one. `None` for a unit variant, which has no
-    /// fields to offer.
-    fn payload_fields(&self) -> Option<(FieldList<'s>, &'s [LNode])> {
-        match (self.shape, self.lnode) {
-            // A unit variant is the empty product, so it can grow fields on
-            // the same terms a unit struct can: they are all missing, and each
-            // falls to its `#[serde(default)]`.
-            (VariantNode::Unit, _) => Some((FieldList::Plain(&[]), &[])),
-            (VariantNode::Newtype(inner), LNode::Newtype(linner)) => Some((
-                FieldList::Plain(std::slice::from_ref(&**inner)),
-                std::slice::from_ref(&**linner),
-            )),
-            (VariantNode::Tuple(fields), LNode::Product(lfields)) => {
-                Some((FieldList::Plain(fields), lfields))
-            }
-            (VariantNode::Struct(fields), LNode::Product(lfields)) => {
-                Some((FieldList::Named(fields), lfields))
-            }
-            _ => unreachable!("layout was built from this schema"),
+    /// asks for a different one. A unit variant is the empty product, so it
+    /// can grow fields on the same terms a unit struct can: they are all
+    /// missing, and each falls to its `#[serde(default)]`.
+    fn payload_fields(&self) -> FieldList<'s> {
+        match self.kind {
+            VariantKind::Unit => FieldList::Plain(&[]),
+            VariantKind::Newtype(inner) => FieldList::Plain(std::slice::from_ref(&**inner)),
+            VariantKind::Tuple(fields) => FieldList::Plain(fields),
+            VariantKind::Struct(fields) => FieldList::Named(fields),
         }
     }
 }
 
-fn variant_shape_name(shape: &VariantNode) -> &'static str {
-    match shape {
-        VariantNode::Unit => "unit variant",
-        VariantNode::Newtype(_) => "newtype variant",
-        VariantNode::Tuple(_) => "tuple variant",
-        VariantNode::Struct(_) => "struct variant",
+fn variant_shape_name(kind: &VariantKind) -> &'static str {
+    match kind {
+        VariantKind::Unit => "unit variant",
+        VariantKind::Newtype(_) => "newtype variant",
+        VariantKind::Tuple(_) => "tuple variant",
+        VariantKind::Struct(_) => "struct variant",
     }
 }

@@ -155,12 +155,7 @@ pub fn serialize<T: Serialize + DeserializeOwned + 'static>(
     rest: &mut &mut [Vec<u8>],
 ) -> Result<()> {
     let traced = traced::<T>();
-    crate::ser::serialize_value(
-        value,
-        &traced.node,
-        &traced.layout.root,
-        __split(rest, traced.columns),
-    )
+    crate::ser::serialize_value(value, &traced.layout.root, __split(rest, traced.columns))
 }
 
 /// Reads one `#[carbonite(serde)]` field, taking its columns off the front of
@@ -178,15 +173,10 @@ pub fn deserialize<'de, T: DeserializeOwned + 'static>(
     rest: &mut &mut [ColumnCursor<'de>],
 ) -> Result<T> {
     let traced = traced::<T>();
-    // `fast` is sound here precisely because the node came from tracing `T`
+    // `fast` is sound here precisely because the layout came from tracing `T`
     // itself: the columnar path only runs when the file schema equals the
     // type's own, so this subtree is positional.
-    crate::de::deserialize_value(
-        &traced.node,
-        &traced.layout.root,
-        __split(rest, traced.columns),
-        true,
-    )
+    crate::de::deserialize_value(&traced.layout.root, __split(rest, traced.columns), true)
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
-//! Columnar serialization: a [`serde::Serializer`] that walks the schema in
-//! lockstep with the value and routes every leaf into its column buffer.
+//! Columnar serialization: a [`serde::Serializer`] that walks the annotated
+//! schema tree in lockstep with the value and routes every leaf into its
+//! column buffer.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -10,8 +11,8 @@ use serde::ser::{self, Serialize};
 use crate::columnar::SerializeColumns;
 use crate::de::columnar_schema_mismatch;
 use crate::error::{Error, Result};
-use crate::layout::{ColId, LNode, Layout};
-use crate::schema::{Primitive, Schema, SchemaNode, VariantNode};
+use crate::layout::{ColId, Layout, Node, Variant, VariantKind};
+use crate::schema::{Primitive, Schema, SchemaNode};
 use crate::varint;
 
 /// Serializes values of type `T` according to a [`Schema<T>`].
@@ -105,8 +106,8 @@ impl<'s, T: ?Sized> Serializer<'s, T> {
     /// value.
     pub fn batch(&self) -> Batch<'_, T> {
         Batch {
-            root_node: self.schema.node(),
-            root_lnode: &self.layout.root,
+            schema_root: self.schema.node(),
+            root: &self.layout.root,
             columns: vec![Vec::new(); self.layout.columns],
             rollback: Vec::with_capacity(self.layout.columns),
             rows: 0,
@@ -120,8 +121,9 @@ impl<'s, T: ?Sized> Serializer<'s, T> {
 /// the blob.
 #[must_use]
 pub struct Batch<'a, T: ?Sized> {
-    root_node: &'a SchemaNode,
-    root_lnode: &'a LNode,
+    /// The schema tree, for the one-time equality check in `push_columns`.
+    schema_root: &'a SchemaNode,
+    root: &'a Node,
     columns: Vec<Vec<u8>>,
     rollback: Vec<usize>,
     rows: u64,
@@ -148,8 +150,7 @@ impl<T: ?Sized> Batch<'_, T> {
         self.rollback.extend(self.columns.iter().map(Vec::len));
         let _shared_scope = crate::shared::RowScope::begin();
         let result = value.serialize(ValueSerializer {
-            node: self.root_node,
-            lnode: self.root_lnode,
+            node: self.root,
             columns: &mut self.columns,
         });
         match result {
@@ -181,7 +182,7 @@ impl<T: ?Sized> Batch<'_, T> {
         T: SerializeColumns,
     {
         if !self.static_verified {
-            if T::schema_node() != *self.root_node {
+            if T::schema_node() != *self.schema_root {
                 return Err(columnar_schema_mismatch());
             }
             self.static_verified = true;
@@ -295,26 +296,20 @@ impl<T: ?Sized> fmt::Debug for Batch<'_, T> {
 /// (see [`crate::fallback`]).
 pub(crate) fn serialize_value<T: Serialize + ?Sized>(
     value: &T,
-    node: &SchemaNode,
-    lnode: &LNode,
+    node: &Node,
     columns: &mut [Vec<u8>],
 ) -> Result<()> {
-    value.serialize(ValueSerializer {
-        node,
-        lnode,
-        columns,
-    })
+    value.serialize(ValueSerializer { node, columns })
 }
 
 // ---------------------------------------------------------------------------
 // The serde::Serializer implementation.
 // ---------------------------------------------------------------------------
 
-/// Serializes one value position: a schema node, its layout node, and the
-/// shared column buffers.
+/// Serializes one value position: an annotated schema node and the shared
+/// column buffers.
 struct ValueSerializer<'a, 'c> {
-    node: &'a SchemaNode,
-    lnode: &'a LNode,
+    node: &'a Node,
     columns: &'c mut [Vec<u8>],
 }
 
@@ -330,30 +325,29 @@ impl ValueSerializer<'_, '_> {
     /// first guess) and writes its tag.
     fn enter_variant<'a>(
         &mut self,
-        variants: &'a [(String, VariantNode)],
-        lvariants: &'a [LNode],
+        variants: &'a [Variant],
         tag_col: ColId,
         index: u32,
         name: &str,
-    ) -> Result<(&'a VariantNode, &'a LNode)> {
+    ) -> Result<&'a VariantKind> {
         let guess = index as usize;
         let position = match variants.get(guess) {
-            Some((variant_name, _)) if variant_name == name => guess,
+            Some(variant) if variant.name == name => guess,
             _ => variants
                 .iter()
-                .position(|(variant_name, _)| variant_name == name)
+                .position(|variant| variant.name == name)
                 .ok_or_else(|| self.mismatch(format!("variant `{name}`")))?,
         };
         varint::write(&mut self.columns[tag_col], position as u64);
-        Ok((&variants[position].1, &lvariants[position]))
+        Ok(&variants[position].kind)
     }
 }
 
 macro_rules! serialize_primitive {
     ($method:ident, $ty:ty, $prim:ident) => {
         fn $method(self, v: $ty) -> Result<()> {
-            match (self.node, self.lnode) {
-                (SchemaNode::Primitive(Primitive::$prim), LNode::Primitive(col)) => {
+            match self.node {
+                Node::Primitive(Primitive::$prim, col) => {
                     self.columns[*col].extend_from_slice(&v.to_le_bytes());
                     Ok(())
                 }
@@ -375,8 +369,8 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
     type SerializeStructVariant = StructSerializer<'a, 'c>;
 
     fn serialize_bool(self, v: bool) -> Result<()> {
-        match (self.node, self.lnode) {
-            (SchemaNode::Primitive(Primitive::Bool), LNode::Primitive(col)) => {
+        match self.node {
+            Node::Primitive(Primitive::Bool, col) => {
                 self.columns[*col].push(u8::from(v));
                 Ok(())
             }
@@ -398,8 +392,8 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
     serialize_primitive!(serialize_f64, f64, F64);
 
     fn serialize_char(self, v: char) -> Result<()> {
-        match (self.node, self.lnode) {
-            (SchemaNode::Primitive(Primitive::Char), LNode::Primitive(col)) => {
+        match self.node {
+            Node::Primitive(Primitive::Char, col) => {
                 self.columns[*col].extend_from_slice(&(v as u32).to_le_bytes());
                 Ok(())
             }
@@ -408,8 +402,12 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
     }
 
     fn serialize_str(self, v: &str) -> Result<()> {
-        match (self.node, self.lnode) {
-            (SchemaNode::String, LNode::Str { len, data }) => {
+        match self.node {
+            Node::Str {
+                bytes: false,
+                len,
+                data,
+            } => {
                 varint::write(&mut self.columns[*len], v.len() as u64);
                 self.columns[*data].extend_from_slice(v.as_bytes());
                 Ok(())
@@ -419,8 +417,12 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
     }
 
     fn serialize_bytes(self, v: &[u8]) -> Result<()> {
-        match (self.node, self.lnode) {
-            (SchemaNode::Bytes, LNode::Str { len, data }) => {
+        match self.node {
+            Node::Str {
+                bytes: true,
+                len,
+                data,
+            } => {
                 varint::write(&mut self.columns[*len], v.len() as u64);
                 self.columns[*data].extend_from_slice(v);
                 Ok(())
@@ -430,8 +432,8 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
     }
 
     fn serialize_none(self) -> Result<()> {
-        match (self.node, self.lnode) {
-            (SchemaNode::Option(_), LNode::Option { tag, .. }) => {
+        match self.node {
+            Node::Option { tag, .. } => {
                 self.columns[*tag].push(0);
                 Ok(())
             }
@@ -440,12 +442,11 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
     }
 
     fn serialize_some<V: ?Sized + Serialize>(self, value: &V) -> Result<()> {
-        match (self.node, self.lnode) {
-            (SchemaNode::Option(inner), LNode::Option { tag, inner: linner }) => {
+        match self.node {
+            Node::Option { tag, inner } => {
                 self.columns[*tag].push(1);
                 value.serialize(ValueSerializer {
                     node: inner,
-                    lnode: linner,
                     columns: self.columns,
                 })
             }
@@ -455,14 +456,16 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
 
     fn serialize_unit(self) -> Result<()> {
         match self.node {
-            SchemaNode::Unit => Ok(()),
+            Node::Unit { name: None } => Ok(()),
             _ => Err(self.mismatch("unit")),
         }
     }
 
     fn serialize_unit_struct(self, name: &'static str) -> Result<()> {
         match self.node {
-            SchemaNode::UnitStruct { name: schema_name } if schema_name == name => Ok(()),
+            Node::Unit {
+                name: Some(schema_name),
+            } if schema_name == name => Ok(()),
             _ => Err(self.mismatch(format!("unit struct `{name}`"))),
         }
     }
@@ -473,18 +476,10 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
         variant_index: u32,
         variant: &'static str,
     ) -> Result<()> {
-        match (self.node, self.lnode) {
-            (
-                SchemaNode::Enum { variants, .. },
-                LNode::Enum {
-                    tag,
-                    variants: lvariants,
-                },
-            ) => {
-                let (shape, _) =
-                    self.enter_variant(variants, lvariants, *tag, variant_index, variant)?;
-                match shape {
-                    VariantNode::Unit => Ok(()),
+        match self.node {
+            Node::Enum { tag, variants, .. } => {
+                match self.enter_variant(variants, *tag, variant_index, variant)? {
+                    VariantKind::Unit => Ok(()),
                     _ => Err(Error::SchemaMismatch {
                         expected: format!("payload for variant `{variant}`"),
                         found: "unit variant".to_owned(),
@@ -501,8 +496,8 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
         value: &V,
     ) -> Result<()> {
         if name == crate::shared::SHARED_TOKEN {
-            return match (self.node, self.lnode) {
-                (SchemaNode::Shared(inner), LNode::Shared { key, inner: linner }) => {
+            return match self.node {
+                Node::Shared { key, inner } => {
                     let addr = crate::shared::take_stashed_addr().ok_or_else(|| {
                         Error::Message(
                             "carbonite::Shared protocol violation: shared token without a \
@@ -520,7 +515,6 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
                             varint::write(&mut self.columns[*key], k);
                             value.serialize(ValueSerializer {
                                 node: inner,
-                                lnode: linner,
                                 columns: self.columns,
                             })
                         }
@@ -531,16 +525,12 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
                 _ => value.serialize(self),
             };
         }
-        match (self.node, self.lnode) {
-            (
-                SchemaNode::NewtypeStruct {
-                    name: schema_name,
-                    inner,
-                },
-                LNode::Newtype(linner),
-            ) if schema_name == name => value.serialize(ValueSerializer {
+        match self.node {
+            Node::Newtype {
+                name: schema_name,
+                inner,
+            } if schema_name == name => value.serialize(ValueSerializer {
                 node: inner,
-                lnode: linner,
                 columns: self.columns,
             }),
             _ => Err(self.mismatch(format!("newtype struct `{name}`"))),
@@ -554,24 +544,13 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
         variant: &'static str,
         value: &V,
     ) -> Result<()> {
-        match (self.node, self.lnode) {
-            (
-                SchemaNode::Enum { variants, .. },
-                LNode::Enum {
-                    tag,
-                    variants: lvariants,
-                },
-            ) => {
-                let (shape, lshape) =
-                    self.enter_variant(variants, lvariants, *tag, variant_index, variant)?;
-                match (shape, lshape) {
-                    (VariantNode::Newtype(inner), LNode::Newtype(linner)) => {
-                        value.serialize(ValueSerializer {
-                            node: inner,
-                            lnode: linner,
-                            columns: self.columns,
-                        })
-                    }
+        match self.node {
+            Node::Enum { tag, variants, .. } => {
+                match self.enter_variant(variants, *tag, variant_index, variant)? {
+                    VariantKind::Newtype(inner) => value.serialize(ValueSerializer {
+                        node: inner,
+                        columns: self.columns,
+                    }),
                     _ => Err(Error::SchemaMismatch {
                         expected: format!("shape of variant `{variant}`"),
                         found: "newtype variant".to_owned(),
@@ -583,15 +562,9 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
     }
 
     fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq> {
-        match (self.node, self.lnode) {
-            (
-                SchemaNode::Seq(elem),
-                LNode::Seq {
-                    len, elem: lelem, ..
-                },
-            ) => Ok(SeqSerializer {
+        match self.node {
+            Node::Seq { len, elem, .. } => Ok(SeqSerializer {
                 elem,
-                lelem,
                 len_col: *len,
                 columns: self.columns,
                 count: 0,
@@ -601,15 +574,12 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
     }
 
     fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple> {
-        match (self.node, self.lnode) {
-            (SchemaNode::Tuple(fields), LNode::Product(lfields)) if fields.len() == len => {
-                Ok(ProductSerializer {
-                    fields,
-                    lfields,
-                    columns: self.columns,
-                    index: 0,
-                })
-            }
+        match self.node {
+            Node::Tuple { name: None, fields } if fields.len() == len => Ok(ProductSerializer {
+                fields,
+                columns: self.columns,
+                index: 0,
+            }),
             _ => Err(self.mismatch(format!("{len}-tuple"))),
         }
     }
@@ -619,16 +589,12 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
         name: &'static str,
         len: usize,
     ) -> Result<Self::SerializeTupleStruct> {
-        match (self.node, self.lnode) {
-            (
-                SchemaNode::TupleStruct {
-                    name: schema_name,
-                    fields,
-                },
-                LNode::Product(lfields),
-            ) if schema_name == name && fields.len() == len => Ok(ProductSerializer {
+        match self.node {
+            Node::Tuple {
+                name: Some(schema_name),
                 fields,
-                lfields,
+            } if schema_name == name && fields.len() == len => Ok(ProductSerializer {
+                fields,
                 columns: self.columns,
                 index: 0,
             }),
@@ -643,27 +609,14 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
         variant: &'static str,
         len: usize,
     ) -> Result<Self::SerializeTupleVariant> {
-        match (self.node, self.lnode) {
-            (
-                SchemaNode::Enum { variants, .. },
-                LNode::Enum {
-                    tag,
-                    variants: lvariants,
-                },
-            ) => {
-                let (shape, lshape) =
-                    self.enter_variant(variants, lvariants, *tag, variant_index, variant)?;
-                match (shape, lshape) {
-                    (VariantNode::Tuple(fields), LNode::Product(lfields))
-                        if fields.len() == len =>
-                    {
-                        Ok(ProductSerializer {
-                            fields,
-                            lfields,
-                            columns: self.columns,
-                            index: 0,
-                        })
-                    }
+        match self.node {
+            Node::Enum { tag, variants, .. } => {
+                match self.enter_variant(variants, *tag, variant_index, variant)? {
+                    VariantKind::Tuple(fields) if fields.len() == len => Ok(ProductSerializer {
+                        fields,
+                        columns: self.columns,
+                        index: 0,
+                    }),
                     _ => Err(Error::SchemaMismatch {
                         expected: format!("shape of variant `{variant}`"),
                         found: format!("{len}-tuple variant"),
@@ -675,20 +628,12 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
     }
 
     fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap> {
-        match (self.node, self.lnode) {
-            (
-                SchemaNode::Map { key, value },
-                LNode::Map {
-                    len,
-                    key: lkey,
-                    value: lvalue,
-                    ..
-                },
-            ) => Ok(MapSerializer {
+        match self.node {
+            Node::Map {
+                len, key, value, ..
+            } => Ok(MapSerializer {
                 key,
-                lkey,
                 value,
-                lvalue,
                 len_col: *len,
                 columns: self.columns,
                 count: 0,
@@ -699,20 +644,16 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
     }
 
     fn serialize_struct(self, name: &'static str, len: usize) -> Result<Self::SerializeStruct> {
-        match (self.node, self.lnode) {
-            (
-                SchemaNode::Struct {
-                    name: schema_name,
-                    fields,
-                },
-                LNode::Product(lfields),
-            ) if schema_name == name => {
+        match self.node {
+            Node::Struct {
+                name: schema_name,
+                fields,
+            } if schema_name == name => {
                 // `len` may be smaller than the schema when fields are
                 // conditionally skipped; end() reports IncompleteRow then.
                 let _ = len;
                 Ok(StructSerializer {
                     fields,
-                    lfields,
                     columns: self.columns,
                     index: 0,
                 })
@@ -728,25 +669,14 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
         variant: &'static str,
         _len: usize,
     ) -> Result<Self::SerializeStructVariant> {
-        match (self.node, self.lnode) {
-            (
-                SchemaNode::Enum { variants, .. },
-                LNode::Enum {
-                    tag,
-                    variants: lvariants,
-                },
-            ) => {
-                let (shape, lshape) =
-                    self.enter_variant(variants, lvariants, *tag, variant_index, variant)?;
-                match (shape, lshape) {
-                    (VariantNode::Struct(fields), LNode::Product(lfields)) => {
-                        Ok(StructSerializer {
-                            fields,
-                            lfields,
-                            columns: self.columns,
-                            index: 0,
-                        })
-                    }
+        match self.node {
+            Node::Enum { tag, variants, .. } => {
+                match self.enter_variant(variants, *tag, variant_index, variant)? {
+                    VariantKind::Struct(fields) => Ok(StructSerializer {
+                        fields,
+                        columns: self.columns,
+                        index: 0,
+                    }),
                     _ => Err(Error::SchemaMismatch {
                         expected: format!("shape of variant `{variant}`"),
                         found: "struct variant".to_owned(),
@@ -767,8 +697,7 @@ impl<'a, 'c> ser::Serializer for ValueSerializer<'a, 'c> {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct SeqSerializer<'a, 'c> {
-    elem: &'a SchemaNode,
-    lelem: &'a LNode,
+    elem: &'a Node,
     len_col: ColId,
     columns: &'c mut [Vec<u8>],
     count: u64,
@@ -781,7 +710,6 @@ impl ser::SerializeSeq for SeqSerializer<'_, '_> {
     fn serialize_element<V: ?Sized + Serialize>(&mut self, value: &V) -> Result<()> {
         value.serialize(ValueSerializer {
             node: self.elem,
-            lnode: self.lelem,
             columns: self.columns,
         })?;
         self.count += 1;
@@ -796,22 +724,16 @@ impl ser::SerializeSeq for SeqSerializer<'_, '_> {
 
 /// Positional fields: tuples, tuple structs, and tuple variants.
 pub(crate) struct ProductSerializer<'a, 'c> {
-    fields: &'a [SchemaNode],
-    lfields: &'a [LNode],
+    fields: &'a [Node],
     columns: &'c mut [Vec<u8>],
     index: usize,
 }
 
 impl ProductSerializer<'_, '_> {
     fn serialize_next<V: ?Sized + Serialize>(&mut self, value: &V) -> Result<()> {
-        let (node, lnode) = self
-            .fields
-            .get(self.index)
-            .zip(self.lfields.get(self.index))
-            .ok_or(Error::IncompleteRow)?;
+        let node = self.fields.get(self.index).ok_or(Error::IncompleteRow)?;
         value.serialize(ValueSerializer {
             node,
-            lnode,
             columns: self.columns,
         })?;
         self.index += 1;
@@ -869,8 +791,7 @@ impl ser::SerializeTupleVariant for ProductSerializer<'_, '_> {
 /// Named fields: structs and struct variants. Field order must match the
 /// schema (serde derives always emit declaration order).
 pub(crate) struct StructSerializer<'a, 'c> {
-    fields: &'a [(String, SchemaNode)],
-    lfields: &'a [LNode],
+    fields: &'a [(String, Node)],
     columns: &'c mut [Vec<u8>],
     index: usize,
 }
@@ -881,11 +802,7 @@ impl StructSerializer<'_, '_> {
         key: &'static str,
         value: &V,
     ) -> Result<()> {
-        let Some(((name, node), lnode)) = self
-            .fields
-            .get(self.index)
-            .zip(self.lfields.get(self.index))
-        else {
+        let Some((name, node)) = self.fields.get(self.index) else {
             return Err(Error::SchemaMismatch {
                 expected: "end of struct".to_owned(),
                 found: format!("field `{key}`"),
@@ -899,7 +816,6 @@ impl StructSerializer<'_, '_> {
         }
         value.serialize(ValueSerializer {
             node,
-            lnode,
             columns: self.columns,
         })?;
         self.index += 1;
@@ -958,10 +874,8 @@ impl ser::SerializeStructVariant for StructSerializer<'_, '_> {
 }
 
 pub(crate) struct MapSerializer<'a, 'c> {
-    key: &'a SchemaNode,
-    lkey: &'a LNode,
-    value: &'a SchemaNode,
-    lvalue: &'a LNode,
+    key: &'a Node,
+    value: &'a Node,
     len_col: ColId,
     columns: &'c mut [Vec<u8>],
     count: u64,
@@ -980,7 +894,6 @@ impl ser::SerializeMap for MapSerializer<'_, '_> {
         }
         key.serialize(ValueSerializer {
             node: self.key,
-            lnode: self.lkey,
             columns: self.columns,
         })?;
         self.awaiting_value = true;
@@ -995,7 +908,6 @@ impl ser::SerializeMap for MapSerializer<'_, '_> {
         }
         value.serialize(ValueSerializer {
             node: self.value,
-            lnode: self.lvalue,
             columns: self.columns,
         })?;
         self.awaiting_value = false;

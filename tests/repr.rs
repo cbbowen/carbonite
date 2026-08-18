@@ -304,10 +304,10 @@ fn the_bytes_are_the_reprs_bytes() {
     // A converted value and its repr are the same blob, so a peer holding only
     // the repr type reads it with no idea a conversion happened.
     let angle = Degrees(37.5);
-    let converted = Serializer::new(&Degrees::schema())
+    let converted = Serializer::new(Degrees::schema())
         .to_vec_columns(&angle)
         .unwrap();
-    let raw = Serializer::new(&f64::schema())
+    let raw = Serializer::new(f64::schema())
         .to_vec_columns(&37.5f64)
         .unwrap();
     assert_eq!(converted, raw);
@@ -347,7 +347,7 @@ fn conversions_run_on_both_read_paths() {
 
 #[test]
 fn a_rejected_conversion_reports_the_same_error_on_both_paths() {
-    let bytes = Serializer::new(&RangeRepr::schema())
+    let bytes = Serializer::new(RangeRepr::schema())
         .to_vec_columns(&RangeRepr { lo: 8, hi: 2 })
         .unwrap();
     let de = Deserializer::new_static(Range::schema());

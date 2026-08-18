@@ -136,11 +136,13 @@ scope would close the hazard outright, but the `Serialize` impl lacks a
 
 ## 6. Maintainability
 
-- [ ] **`SchemaNode`/`LNode` lockstep walks**: ~8
-  `unreachable!("layout was built from this schema")` arms across `de.rs`,
-  `ser.rs`, `compat.rs` rely on two trees staying structurally parallel. A
-  fused annotated tree (layout ids attached to schema nodes, built once per
-  `Serializer`/`Deserializer`) would delete the invariant class.
+- [x] **`SchemaNode`/`LNode` lockstep walks**: `Layout` now builds one fused
+  `Node` tree carrying structure, names, and column ids, so the serializer,
+  deserializer, and compat sampler each walk a single tree. Every
+  `unreachable!("layout was built from this schema")` arm is gone (grep says
+  zero), along with the parallel-walk invariant they guarded; a layout test
+  pins `Node::describe` to `SchemaNode::describe` since both feed the same
+  error messages.
 - [x] **Split the derive** into `attrs` (parsing and rejection), `model`
   (field/generics analysis), `schema` (schema-tree codegen), `columnar`
   (fast-path codegen), `as_repr`, and `rename`. Ten trybuild cases in

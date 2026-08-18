@@ -298,10 +298,10 @@ fn blobs_carry_nothing_glam_specific() {
     #[derive(Serialize, Deserialize, carbonite::Schema, PartialEq, Debug)]
     struct Point(f32, f32, f32);
 
-    let from_glam = Serializer::new(&Vec3::schema())
+    let from_glam = Serializer::new(Vec3::schema())
         .to_vec_columns(&Vec3::new(1.5, -2.5, 3.5))
         .unwrap();
-    let from_plain = Serializer::new(&Point::schema())
+    let from_plain = Serializer::new(Point::schema())
         .to_vec_columns(&Point(1.5, -2.5, 3.5))
         .unwrap();
     assert_eq!(from_glam, from_plain);

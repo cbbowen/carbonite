@@ -74,7 +74,7 @@ use std::fmt;
 use serde::de::DeserializeOwned;
 
 use crate::error::Error;
-use crate::layout::{LNode, Layout};
+use crate::layout::{Layout, Node, VariantKind};
 use crate::schema::{Primitive, Schema, SchemaNode, VariantNode};
 use crate::static_schema::StaticSchema;
 use crate::varint;
@@ -376,7 +376,7 @@ fn sample(writer: &SchemaNode) -> Vec<u8> {
     let rows = variant_span(writer).min(MAX_PROBE_ROWS);
     let mut columns = vec![Vec::new(); layout.columns];
     for pick in 0..rows {
-        write_row(writer, &layout.root, &mut columns, pick);
+        write_row(&layout.root, &mut columns, pick);
     }
 
     let mut out = Vec::new();
@@ -392,71 +392,59 @@ fn sample(writer: &SchemaNode) -> Vec<u8> {
 }
 
 /// Writes one row into the column buffers. `pick` chooses which variant each
-/// enum takes, so cycling it over [`variant_span`] rows covers them all.
-fn write_row(node: &SchemaNode, lnode: &LNode, columns: &mut [Vec<u8>], pick: usize) {
-    match (node, lnode) {
-        (SchemaNode::Primitive(p), LNode::Primitive(col)) => {
+/// enum takes; cycling it over [`variant_span`] rows covers them all.
+fn write_row(node: &Node, columns: &mut [Vec<u8>], pick: usize) {
+    match node {
+        Node::Primitive(p, col) => {
             write_primitive(*p, &mut columns[*col]);
         }
-        (SchemaNode::String, LNode::Str { len, data }) => {
+        Node::Str {
+            bytes: false,
+            len,
+            data,
+        } => {
             varint::write(&mut columns[*len], 1);
             columns[*data].push(b'a');
         }
-        (SchemaNode::Bytes, LNode::Str { len, data }) => {
+        Node::Str {
+            bytes: true,
+            len,
+            data,
+        } => {
             varint::write(&mut columns[*len], 1);
             columns[*data].push(0);
         }
-        (SchemaNode::Unit | SchemaNode::UnitStruct { .. }, LNode::Unit) => {}
-        (SchemaNode::NewtypeStruct { inner, .. }, LNode::Newtype(linner)) => {
-            write_row(inner, linner, columns, pick);
+        Node::Unit { .. } => {}
+        Node::Newtype { inner, .. } => {
+            write_row(inner, columns, pick);
         }
-        (SchemaNode::Option(inner), LNode::Option { tag, inner: linner }) => {
+        Node::Option { tag, inner } => {
             // Present, so the inner value's own columns are exercised too.
             columns[*tag].push(1);
-            write_row(inner, linner, columns, pick);
+            write_row(inner, columns, pick);
         }
-        (
-            SchemaNode::Seq(elem),
-            LNode::Seq {
-                len, elem: lelem, ..
-            },
-        ) => {
+        Node::Seq { len, elem, .. } => {
             varint::write(&mut columns[*len], 1);
-            write_row(elem, lelem, columns, pick);
+            write_row(elem, columns, pick);
         }
-        (
-            SchemaNode::Map { key, value },
-            LNode::Map {
-                len,
-                key: lkey,
-                value: lvalue,
-                ..
-            },
-        ) => {
+        Node::Map {
+            len, key, value, ..
+        } => {
             varint::write(&mut columns[*len], 1);
-            write_row(key, lkey, columns, pick);
-            write_row(value, lvalue, columns, pick);
+            write_row(key, columns, pick);
+            write_row(value, columns, pick);
         }
-        (
-            SchemaNode::Tuple(fields) | SchemaNode::TupleStruct { fields, .. },
-            LNode::Product(lfields),
-        ) => {
-            for (field, lfield) in fields.iter().zip(lfields) {
-                write_row(field, lfield, columns, pick);
+        Node::Tuple { fields, .. } => {
+            for field in fields {
+                write_row(field, columns, pick);
             }
         }
-        (SchemaNode::Struct { fields, .. }, LNode::Product(lfields)) => {
-            for ((_, field), lfield) in fields.iter().zip(lfields) {
-                write_row(field, lfield, columns, pick);
+        Node::Struct { fields, .. } => {
+            for (_, field) in fields {
+                write_row(field, columns, pick);
             }
         }
-        (
-            SchemaNode::Enum { variants, .. },
-            LNode::Enum {
-                tag,
-                variants: lvariants,
-            },
-        ) => {
+        Node::Enum { tag, variants, .. } => {
             // Mixed-radix: this enum consumes the low digit of `pick` and
             // hands the quotient to its payload, so an enum *nested inside a
             // variant* still sees every value of its own digit. Reusing the
@@ -465,39 +453,32 @@ fn write_row(node: &SchemaNode, lnode: &LNode, columns: &mut [Vec<u8>], pick: us
             // two counts share a factor.
             let index = pick % variants.len();
             varint::write(&mut columns[*tag], index as u64);
-            write_variant(
-                &variants[index].1,
-                &lvariants[index],
-                columns,
-                pick / variants.len(),
-            );
+            write_variant(&variants[index].kind, columns, pick / variants.len());
         }
-        (SchemaNode::Shared(inner), LNode::Shared { key, inner: linner }) => {
+        Node::Shared { key, inner } => {
             // Key 0 is a first occurrence, so the payload follows it.
             varint::write(&mut columns[*key], 0);
-            write_row(inner, linner, columns, pick);
+            write_row(inner, columns, pick);
         }
-        _ => unreachable!("layout was built from this schema"),
     }
 }
 
-fn write_variant(shape: &VariantNode, lnode: &LNode, columns: &mut [Vec<u8>], pick: usize) {
-    match (shape, lnode) {
-        (VariantNode::Unit, _) => {}
-        (VariantNode::Newtype(inner), LNode::Newtype(linner)) => {
-            write_row(inner, linner, columns, pick);
+fn write_variant(kind: &VariantKind, columns: &mut [Vec<u8>], pick: usize) {
+    match kind {
+        VariantKind::Unit => {}
+        VariantKind::Newtype(inner) => {
+            write_row(inner, columns, pick);
         }
-        (VariantNode::Tuple(fields), LNode::Product(lfields)) => {
-            for (field, lfield) in fields.iter().zip(lfields) {
-                write_row(field, lfield, columns, pick);
+        VariantKind::Tuple(fields) => {
+            for field in fields {
+                write_row(field, columns, pick);
             }
         }
-        (VariantNode::Struct(fields), LNode::Product(lfields)) => {
-            for ((_, field), lfield) in fields.iter().zip(lfields) {
-                write_row(field, lfield, columns, pick);
+        VariantKind::Struct(fields) => {
+            for (_, field) in fields {
+                write_row(field, columns, pick);
             }
         }
-        _ => unreachable!("layout was built from this schema"),
     }
 }
 
