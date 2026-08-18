@@ -132,6 +132,8 @@ Every row below is a test in `tests/evolution.rs` or `tests/shape_evolution.rs`.
 | Narrow an integer (`u64` → `u32`) | ⚠ | succeeds only for values that fit |
 | Wrap a field in `Option` | ✓ | — (old values read as `Some`) |
 | Unwrap an `Option` | ✗ | |
+| Widen an `Option` to a sequence (`Option<T>` → `Vec<T>`) | ✓ | — (`None` reads empty, `Some` as one element) |
+| Narrow a sequence to an `Option` | ✗ | |
 | Change a field's type | ✗ | |
 | Wrap a field's type in a newtype struct, or unwrap it | ✓ | — |
 | Promote a field to a named struct of its own | ✓ | `#[serde(alias = "0")]` on the field that takes its place |
@@ -231,6 +233,14 @@ position the reader stops naming is dropped.
 **Containers**
 
 `Vec<T>` and `[T; N]` are interchangeable, and an element type evolves by the rules above.
+
+An `Option<T>` also widens into any sequence reader — `Vec<T>`, `VecDeque<T>`, `BTreeSet<T>`,
+and the rest — because it already is a sequence of length zero or one on the wire: a presence
+byte and a varint count of `0`/`1` are the same byte, so the file is read exactly as it was
+written. The widening is one-way. Going back would succeed for the rows holding at most one
+element and fail for the others, and a change that decodes row by row is not one you can ship,
+so it is refused outright. `[T; N]` is a tuple in this format rather than a sequence, so it is
+not a target for the widening.
 
 **Three things worth knowing**
 

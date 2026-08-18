@@ -314,6 +314,105 @@ fn narrowing_an_integer_depends_on_the_value() {
     assert!(err.to_string().contains("999"), "{err}");
 }
 
+/// An `Option` widens to a sequence: `None` arrives empty and `Some` as a
+/// single element. The two are already the same bytes — a presence byte and a
+/// varint count of `0`/`1` — so this reads the file untouched, and the schema
+/// is what says the widening is legitimate.
+#[test]
+fn an_option_widens_to_a_sequence() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Optioned {
+        a: Option<u32>,
+        b: String,
+    }
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Repeated {
+        a: Vec<u32>,
+        b: String,
+    }
+
+    assert_eq!(
+        migrate::<_, Repeated>(&Optioned {
+            a: Some(7),
+            b: "hi".to_owned(),
+        })
+        .unwrap(),
+        Repeated {
+            a: vec![7],
+            b: "hi".to_owned(),
+        }
+    );
+    assert_eq!(
+        migrate::<_, Repeated>(&Optioned {
+            a: None,
+            b: "hi".to_owned(),
+        })
+        .unwrap(),
+        Repeated {
+            a: Vec::new(),
+            b: "hi".to_owned(),
+        }
+    );
+}
+
+/// Every sequence reader gets the widening, not just `Vec` — they all ask the
+/// format for a sequence. A newtype wrapper occupies no columns, so it is
+/// seen through on the way, as everywhere else.
+#[test]
+fn widening_reaches_any_sequence_reader() {
+    use std::collections::{BTreeSet, VecDeque};
+
+    #[derive(Serialize, Deserialize)]
+    struct Optioned {
+        a: Option<u32>,
+    }
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Wrapped(Option<u32>);
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Deque {
+        a: VecDeque<u32>,
+    }
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Set {
+        a: BTreeSet<u32>,
+    }
+
+    assert_eq!(
+        migrate::<_, Deque>(&Optioned { a: Some(7) }).unwrap().a,
+        VecDeque::from(vec![7])
+    );
+    assert_eq!(
+        migrate::<_, Set>(&Optioned { a: Some(7) }).unwrap().a,
+        BTreeSet::from([7])
+    );
+    assert_eq!(migrate::<_, Vec<u32>>(&Wrapped(Some(7))).unwrap(), vec![7]);
+}
+
+/// The widening is one-way. A sequence holds more than an `Option` can, so
+/// narrowing it back would work for some rows and fail for others; it is
+/// refused outright rather than made value-dependent.
+#[test]
+fn a_sequence_does_not_narrow_to_an_option() {
+    #[derive(Serialize, Deserialize)]
+    struct Repeated {
+        a: Vec<u32>,
+    }
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Optioned {
+        a: Option<u32>,
+    }
+
+    // Refused even where the data would fit.
+    assert!(migrate::<_, Optioned>(&Repeated { a: vec![7] }).is_err());
+    assert!(migrate::<_, Optioned>(&Repeated { a: Vec::new() }).is_err());
+    assert!(migrate::<_, Optioned>(&Repeated { a: vec![7, 8] }).is_err());
+}
+
 /// Wrapping in `Option` is a one-way door: old data reads as `Some`, but an
 /// `Option` file cannot be read back into a bare field, even where it holds a
 /// value.

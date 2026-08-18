@@ -253,7 +253,10 @@ fn walk(writer: &SchemaNode, reader: &SchemaNode, path: &mut String, out: &mut V
         (w, SchemaNode::NewtypeStruct { inner: r, .. }) => walk(w, r, path, out),
         (SchemaNode::Option(w), SchemaNode::Option(r))
         | (SchemaNode::Seq(w), SchemaNode::Seq(r))
-        | (SchemaNode::Shared(w), SchemaNode::Shared(r)) => walk(w, r, path, out),
+        | (SchemaNode::Shared(w), SchemaNode::Shared(r))
+        // An `Option` widened to a sequence still holds the same element, so
+        // keep comparing it rather than losing the leaves behind the change.
+        | (SchemaNode::Option(w), SchemaNode::Seq(r)) => walk(w, r, path, out),
         (w, SchemaNode::Option(r)) => walk(w, r, path, out),
         (SchemaNode::Map { key: wk, value: wv }, SchemaNode::Map { key: rk, value: rv }) => {
             scoped(path, "key", |p| walk(wk, rk, p, out));

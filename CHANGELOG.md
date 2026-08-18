@@ -20,6 +20,11 @@ The wire format's own compatibility promises live with `SCHEMA_VERSION` and
 - A `shared` cargo feature (on by default) gating the `Shared`/`SharedArc`
   wrapper API. Blobs holding shared columns still decode with the feature off
   (repeats excepted).
+- `Option<T>` now widens to a sequence: a field that was an `Option` reads into
+  `Vec<T>` (or any other sequence reader), `None` as empty and `Some` as one
+  element. The wire is unchanged — a presence byte and a varint count of `0`/`1`
+  are the same byte — so old files read as they stand. The reverse is still
+  refused: narrowing a sequence back to an `Option` would decode row by row.
 
 ### Fixed
 

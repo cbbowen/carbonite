@@ -375,6 +375,56 @@ fn narrowing_an_integer_is_caught_structurally() {
 }
 
 #[test]
+fn widening_an_option_to_a_sequence_is_readable() {
+    #[derive(Serialize, Deserialize)]
+    struct Optioned {
+        v: Option<u32>,
+        untouched: String,
+    }
+    #[derive(Deserialize)]
+    struct Repeated {
+        v: Vec<u32>,
+        untouched: String,
+    }
+    #[derive(Deserialize)]
+    struct Narrowed {
+        v: Vec<u8>,
+        untouched: String,
+    }
+
+    let released = Schema::<Optioned>::new().unwrap();
+    compat::check::<Repeated>(&released.clone().cast()).unwrap();
+
+    // The widening must not hide what happened to the element behind it.
+    let err = compat::check::<Narrowed>(&released.cast()).unwrap_err();
+    let Incompatible::ValueDependent(findings) = &err else {
+        panic!("expected ValueDependent, got {err}");
+    };
+    assert!(
+        findings[0].contains('v') && findings[0].contains("u32"),
+        "{err}"
+    );
+}
+
+#[test]
+fn narrowing_a_sequence_to_an_option_is_a_break() {
+    #[derive(Serialize, Deserialize)]
+    struct Repeated {
+        v: Vec<u32>,
+        untouched: String,
+    }
+    #[derive(Deserialize)]
+    struct Optioned {
+        v: Option<u32>,
+        untouched: String,
+    }
+
+    let released = Schema::<Repeated>::new().unwrap();
+    let err = compat::check::<Optioned>(&released.cast()).unwrap_err();
+    assert!(matches!(err, Incompatible::Unreadable(_)), "{err}");
+}
+
+#[test]
 fn widening_an_integer_is_not_a_finding() {
     #[derive(Serialize, Deserialize)]
     struct Small {

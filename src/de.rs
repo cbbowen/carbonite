@@ -16,6 +16,10 @@
 //! fields, which is already a no-op; see [`positional_names`] and
 //! [`needs_positional_names`]. The reverse — a named file read into a tuple —
 //! is refused, since a tuple has nowhere to put the declaration.
+//!
+//! An `Option` in the file reads into a sequence, since it is already one of
+//! length zero or one on the wire. That one is a widening too, and refused in
+//! reverse: a sequence narrowed back to an `Option` would decode row by row.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -1073,9 +1077,45 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'_, '_, 'de> {
         self.deserialize_positional(visitor)
     }
 
+    /// The reader wants a sequence. A writer that stored an `Option` here
+    /// already wrote one of length zero or one — a presence byte and a varint
+    /// count of `0`/`1` are the same byte — so it widens without touching the
+    /// data. This is what makes `Option<T>` -> `Vec<T>` a compatible change.
+    ///
+    /// It is a one-way door, and deliberately so: the schema is what records
+    /// which side of it a file was written on, and narrowing the other way
+    /// would succeed or fail per row.
+    fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        // A newtype wrapper occupies no columns, so see through it first,
+        // exactly as `dispatch` does.
+        let mut node = self.node;
+        while let Node::Newtype { inner, .. } = node {
+            node = inner;
+        }
+        let Node::Option { tag, inner } = node else {
+            return self.dispatch(visitor);
+        };
+        let present = match self.cursors[*tag].byte()? {
+            0 => 0,
+            1 => 1,
+            other => {
+                return Err(Error::InvalidTag {
+                    what: "presence",
+                    value: u64::from(other),
+                });
+            }
+        };
+        visitor.visit_seq(ColSeq {
+            node: inner,
+            cursors: self.cursors,
+            remaining: present,
+            fast: self.fast,
+        })
+    }
+
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf seq map enum identifier
+        bytes byte_buf map enum identifier
     }
 
     fn is_human_readable(&self) -> bool {
