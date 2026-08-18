@@ -25,6 +25,8 @@
 //! aliases and real names in one list), so a migrated type needs
 //! `#[derive(carbonite::Schema)]` to be *written*. Reading is unaffected.
 
+// These tests exercise `#[derive(Schema)]` types end to end.
+#![cfg(feature = "derive")]
 use serde::{Deserialize, Serialize};
 
 use carbonite::{Deserializer, Schema, Serializer, StaticSchema};

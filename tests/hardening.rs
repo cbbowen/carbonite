@@ -6,6 +6,8 @@
 //! [`carbonite::Error`], never a panic, an abort, or an allocation out of
 //! proportion to the input.
 
+// These tests exercise `#[derive(Schema)]` types end to end.
+#![cfg(feature = "derive")]
 use carbonite::{Deserializer, Error, Schema, Serializer, StaticSchema};
 use serde::{Deserialize, Serialize};
 

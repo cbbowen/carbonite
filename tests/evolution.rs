@@ -4,6 +4,8 @@
 //! is reconciled with the current type by field name, giving the same
 //! evolution rules as JSON.
 
+// These tests exercise `#[derive(Schema)]` types end to end.
+#![cfg(feature = "derive")]
 use serde::{Deserialize, Serialize};
 
 use carbonite::{Deserializer, Schema, Serializer};

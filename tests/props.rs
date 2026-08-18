@@ -1,5 +1,7 @@
 //! Property tests: arbitrary values of a rich fixture type must round-trip.
 
+// These tests exercise `#[derive(Schema)]` types end to end.
+#![cfg(feature = "derive")]
 use std::collections::BTreeMap;
 
 use proptest::prelude::*;

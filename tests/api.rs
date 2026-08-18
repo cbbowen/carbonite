@@ -1,6 +1,8 @@
 //! The public API surface: the shapes and guarantees downstream code is
 //! allowed to depend on.
 
+// These tests exercise `#[derive(Schema)]` types end to end.
+#![cfg(feature = "derive")]
 use std::fmt::Debug;
 
 use carbonite::{

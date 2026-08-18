@@ -1,6 +1,8 @@
 //! `carbonite::compat`: verifying that today's type still reads the schemas
 //! you shipped, the way a CI job would.
 
+// These tests exercise `#[derive(Schema)]` types end to end.
+#![cfg(feature = "derive")]
 // The candidate types here exist to be deserialized into, not read from; what
 // is under test is whether they decode at all.
 #![allow(dead_code)]
