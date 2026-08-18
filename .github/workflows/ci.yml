@@ -37,7 +37,12 @@ jobs:
         with:
           toolchain: "1.85"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-features --all-targets
+      # Libraries only, not the dev targets: cargo builds every
+      # dev-dependency for any test target, and criterion's MSRV runs ahead of
+      # this one (0.8 needs 1.86). What the promise covers is what a user
+      # compiles — carbonite, the derive, and their real dependencies — so
+      # that is what is checked.
+      - run: cargo check --workspace --all-features
 
   lint:
     name: Format and clippy
